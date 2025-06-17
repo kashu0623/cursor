@@ -9,6 +9,15 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import random
 
+# 전역 설정 상수
+SAMPLING_RATE = 25.0        # Hz
+WINDOW_DURATION = 30        # seconds
+STRIDE_DURATION = 10        # seconds
+
+# 계산된 상수
+WINDOW_SIZE = int(SAMPLING_RATE * WINDOW_DURATION)
+STRIDE_SIZE = int(SAMPLING_RATE * STRIDE_DURATION)
+
 class SleepDataPreprocessor:
     """수면 데이터 전처리 클래스
     
@@ -16,7 +25,7 @@ class SleepDataPreprocessor:
     심박수, HRV, 호흡률, SpO2 등의 생체 지표를 계산합니다.
     """
     
-    def __init__(self, sampling_rate=25.0):
+    def __init__(self, sampling_rate=SAMPLING_RATE):
         """초기화 함수
         
         Args:
@@ -217,15 +226,15 @@ class MotionFeatureExtractor:
 class SleepDataset(Dataset):
     """수면 데이터셋 클래스"""
     
-    def __init__(self, features, labels, sequence_length=30, stride=5):
+    def __init__(self, features, labels, window_size=WINDOW_SIZE, stride_size=STRIDE_SIZE):
         self.features = features
         self.labels = labels
-        self.sequence_length = sequence_length
-        self.stride = stride
+        self.window_size = window_size
+        self.stride_size = stride_size
         
         # 시퀀스 인덱스 생성
         self.sequences = []
-        for i in range(0, len(features) - sequence_length + 1, stride):
+        for i in range(0, len(features) - window_size + 1, stride_size):
             self.sequences.append(i)
     
     def __len__(self):
@@ -233,7 +242,7 @@ class SleepDataset(Dataset):
     
     def __getitem__(self, idx):
         start_idx = self.sequences[idx]
-        end_idx = start_idx + self.sequence_length
+        end_idx = start_idx + self.window_size
         
         x = self.features[start_idx:end_idx]
         y = self.labels[end_idx - 1]  # 시퀀스의 마지막 타임스텝의 레이블 사용
@@ -276,7 +285,7 @@ class SleepStageClassifier(nn.Module):
         lstm_out, _ = self.lstm(x)
         return self.fc(lstm_out[:, -1, :])  # 마지막 타임스텝의 출력만 사용
 
-def generate_dummy_data(n_samples=1000, sequence_length=60, sampling_rate=25.0):
+def generate_dummy_data(n_samples=1000, sequence_length=WINDOW_SIZE, sampling_rate=SAMPLING_RATE):
     """더미 데이터 생성
     
     Args:
@@ -393,16 +402,14 @@ def main():
     """메인 실행 함수"""
     # 하이퍼파라미터 설정
     BATCH_SIZE = 32
-    SEQUENCE_LENGTH = 30  # 30초 시퀀스
-    STRIDE = 5  # 5초 stride
     EPOCHS = 100
     PATIENCE = 10  # Early stopping patience
     
     # 더미 데이터 생성
-    data = generate_dummy_data(sampling_rate=25.0)
+    data = generate_dummy_data(sampling_rate=SAMPLING_RATE)
     
     # 전처리 및 특징 추출
-    preprocessor = SleepDataPreprocessor(sampling_rate=25.0)
+    preprocessor = SleepDataPreprocessor(sampling_rate=SAMPLING_RATE)
     motion_extractor = MotionFeatureExtractor()
     
     features = []
@@ -448,8 +455,8 @@ def main():
     X_test = scaler.transform(X_test)
     
     # 데이터셋 및 데이터로더 생성
-    train_dataset = SleepDataset(X_train, y_train, SEQUENCE_LENGTH, STRIDE)
-    test_dataset = SleepDataset(X_test, y_test, SEQUENCE_LENGTH, STRIDE)
+    train_dataset = SleepDataset(X_train, y_train, WINDOW_SIZE, STRIDE_SIZE)
+    test_dataset = SleepDataset(X_test, y_test, WINDOW_SIZE, STRIDE_SIZE)
     
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
