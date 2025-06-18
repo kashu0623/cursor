@@ -190,9 +190,9 @@ class SleepDataPreprocessor:
         Returns:
             float: 신호 품질 지수 (0-1)
         """
-        # 신호 대 잡음비 (SNR) 계산
-        ir_snr = np.mean(np.abs(ir_signal)) / np.std(ir_signal)
-        red_snr = np.mean(np.abs(red_signal)) / np.std(red_signal)
+        # 신호 대 잡음비 (SNR) 계산 - 분모 0 방지를 위해 작은 값 추가
+        ir_snr = np.mean(np.abs(ir_signal)) / (np.std(ir_signal) + 1e-6)
+        red_snr = np.mean(np.abs(red_signal)) / (np.std(red_signal) + 1e-6)
         
         # 신호 품질 지수 계산 (0-1 범위)
         quality = (ir_snr + red_snr) / 2
@@ -280,11 +280,14 @@ class SleepStageClassifier(nn.Module):
         """순전파 함수
         
         Args:
-            x (torch.Tensor): 입력 데이터 (batch_size, sequence_length, input_size)
+            x (torch.Tensor): 입력 데이터 (batch_size, feature_dim)
             
         Returns:
             torch.Tensor: 수면 단계 예측값
         """
+        # LSTM 입력 차원 맞추기: (batch_size, feature_dim) -> (batch_size, 1, feature_dim)
+        x = x.unsqueeze(1)
+        
         lstm_out, _ = self.lstm(x)
         return self.fc(lstm_out[:, -1, :])  # 마지막 타임스텝의 출력만 사용
 
