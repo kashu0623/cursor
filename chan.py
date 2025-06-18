@@ -1,18 +1,25 @@
+import random
 import numpy as np
+import torch
+random.seed(42)
+np.random.seed(42)
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(42)
+
 import pandas as pd
 from scipy import signal as scipy_signal
 import heartpy as hp
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
-import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-import random
 
 # 전역 설정 상수
 SAMPLING_RATE = 25.0        # Hz
 WINDOW_DURATION = 30        # seconds
 STRIDE_DURATION = 10        # seconds
+QUALITY_THRESHOLD = 0.5     # 신호 품질 임계값
 
 # 계산된 상수
 WINDOW_SIZE = int(SAMPLING_RATE * WINDOW_DURATION)
@@ -25,13 +32,15 @@ class SleepDataPreprocessor:
     심박수, HRV, 호흡률, SpO2 등의 생체 지표를 계산합니다.
     """
     
-    def __init__(self, sampling_rate=SAMPLING_RATE):
+    def __init__(self, sampling_rate=SAMPLING_RATE, quality_threshold=QUALITY_THRESHOLD):
         """초기화 함수
         
         Args:
             sampling_rate (float): 데이터 샘플링 주파수 (Hz)
+            quality_threshold (float): 신호 품질 임계값
         """
         self.sampling_rate = sampling_rate
+        self.quality_threshold = quality_threshold
         
     def extract_ppg_features(self, ir_signal, red_signal):
         """PPG 신호로부터 생체 지표 추출
@@ -45,14 +54,19 @@ class SleepDataPreprocessor:
         """
         # 신호 품질 검사
         quality_index = self._calculate_signal_quality(ir_signal, red_signal)
-        if quality_index < 0.5:  # 품질이 낮은 경우
+        if quality_index < self.quality_threshold:  # 품질이 낮은 경우
             return None, None, None, None, quality_index
             
         # IR 신호만 사용하여 심박수 및 HRV 계산
         filtered_ir = self._filter_signal(ir_signal)
-        working_data, measures = hp.process(filtered_ir, self.sampling_rate)
-        hr = measures['bpm']  # 심박수 (beats per minute)
-        hrv = measures['sdnn']  # 심박변이도 (Standard Deviation of NN intervals)
+        
+        try:
+            working_data, measures = hp.process(filtered_ir, self.sampling_rate)
+            hr = measures['bpm']  # 심박수 (beats per minute)
+            hrv = measures['sdnn']  # 심박변이도 (Standard Deviation of NN intervals)
+        except Exception:
+            # HeartPy 처리 실패 시 품질 임계값으로 스킵
+            return None, None, None, None, quality_index
         
         # 호흡률 추출 (IR 신호 기반)
         rr = self._extract_respiratory_rate(filtered_ir)
@@ -120,7 +134,7 @@ class SleepDataPreprocessor:
         red_ac = self._extract_ac_component(red_signal)
         red_dc = self._extract_dc_component(red_signal)
         
-        # R 값 계산 (SpO2 계산에 사용되는 비율)
+        # R 값 계산 (SpO2 계산에 사용되는 비율) - 스칼라 값으로 계산
         r_value = (red_ac/red_dc) / (ir_ac/ir_dc)
         
         # R 값을 SpO2로 변환 (근사 공식)
@@ -133,36 +147,38 @@ class SleepDataPreprocessor:
     def _extract_ac_component(self, input_signal):
         """신호의 AC 성분 추출
         
-        고주파 필터를 사용하여 신호의 AC(교류) 성분을 추출합니다.
+        고주파 필터를 사용하여 신호의 AC(교류) 성분을 추출하고 스칼라 지표로 반환합니다.
         
         Args:
             input_signal (np.array): 입력 신호
             
         Returns:
-            np.array: AC 성분
+            float: AC 성분의 peak-to-peak 값
         """
         # 고주파 성분 추출 (AC 성분)
         nyquist = self.sampling_rate / 2
         high = 0.5 / nyquist
         b, a = scipy_signal.butter(4, high, btype='high')
-        return np.abs(scipy_signal.filtfilt(b, a, input_signal))
+        ac_signal = scipy_signal.filtfilt(b, a, input_signal)
+        return np.ptp(ac_signal)  # peak-to-peak 값 반환
     
     def _extract_dc_component(self, input_signal):
         """신호의 DC 성분 추출
         
-        저주파 필터를 사용하여 신호의 DC(직류) 성분을 추출합니다.
+        저주파 필터를 사용하여 신호의 DC(직류) 성분을 추출하고 스칼라 지표로 반환합니다.
         
         Args:
             input_signal (np.array): 입력 신호
             
         Returns:
-            np.array: DC 성분
+            float: DC 성분의 평균값
         """
         # 저주파 성분 추출 (DC 성분)
         nyquist = self.sampling_rate / 2
         low = 0.5 / nyquist
         b, a = scipy_signal.butter(4, low, btype='low')
-        return np.abs(scipy_signal.filtfilt(b, a, input_signal))
+        dc_signal = scipy_signal.filtfilt(b, a, input_signal)
+        return np.mean(np.abs(dc_signal))  # 평균값 반환
         
     def _calculate_signal_quality(self, ir_signal, red_signal):
         """신호 품질 지수 계산
@@ -226,28 +242,15 @@ class MotionFeatureExtractor:
 class SleepDataset(Dataset):
     """수면 데이터셋 클래스"""
     
-    def __init__(self, features, labels, window_size=WINDOW_SIZE, stride_size=STRIDE_SIZE):
+    def __init__(self, features, labels):
         self.features = features
         self.labels = labels
-        self.window_size = window_size
-        self.stride_size = stride_size
-        
-        # 시퀀스 인덱스 생성
-        self.sequences = []
-        for i in range(0, len(features) - window_size + 1, stride_size):
-            self.sequences.append(i)
     
     def __len__(self):
-        return len(self.sequences)
+        return len(self.features)
     
     def __getitem__(self, idx):
-        start_idx = self.sequences[idx]
-        end_idx = start_idx + self.window_size
-        
-        x = self.features[start_idx:end_idx]
-        y = self.labels[end_idx - 1]  # 시퀀스의 마지막 타임스텝의 레이블 사용
-        
-        return torch.FloatTensor(x), torch.LongTensor([y])[0]
+        return torch.FloatTensor(self.features[idx]), torch.LongTensor([self.labels[idx]])[0]
 
 class SleepStageClassifier(nn.Module):
     """수면 단계 분류 모델
@@ -294,7 +297,7 @@ def generate_dummy_data(n_samples=1000, sequence_length=WINDOW_SIZE, sampling_ra
         sampling_rate (float): 샘플링 주파수 (Hz)
         
     Returns:
-        pd.DataFrame: 생성된 더미 데이터
+        dict: 생성된 더미 데이터
     """
     # 기본 신호 생성
     t = np.linspace(0, sequence_length/sampling_rate, sequence_length)
@@ -305,59 +308,78 @@ def generate_dummy_data(n_samples=1000, sequence_length=WINDOW_SIZE, sampling_ra
     hr = hr_base + hr_variation
     
     # PPG 신호 생성 (심박수 기반)
-    ir_signal = np.zeros((n_samples, sequence_length))
-    red_signal = np.zeros((n_samples, sequence_length))
+    ir_signals = []
+    red_signals = []
     
     for i in range(n_samples):
         # 기본 PPG 파형
+        ir_signal = np.zeros(sequence_length)
+        red_signal = np.zeros(sequence_length)
+        
         for j in range(sequence_length):
             phase = 2 * np.pi * hr[i] * t[j] / 60  # 심박수에 따른 위상
-            ir_signal[i, j] = np.sin(phase) + 0.2 * np.sin(2 * phase)  # 기본 파형
-            red_signal[i, j] = 0.8 * np.sin(phase) + 0.15 * np.sin(2 * phase)  # RED는 약간 다른 진폭
+            ir_signal[j] = np.sin(phase) + 0.2 * np.sin(2 * phase)  # 기본 파형
+            red_signal[j] = 0.8 * np.sin(phase) + 0.15 * np.sin(2 * phase)  # RED는 약간 다른 진폭
             
         # 호흡 변동 추가
         breathing = 0.1 * np.sin(2 * np.pi * 0.2 * t)  # 0.2 Hz 호흡
-        ir_signal[i] += breathing
-        red_signal[i] += 0.8 * breathing
+        ir_signal += breathing
+        red_signal += 0.8 * breathing
         
         # 움직임 아티팩트 추가 (가끔 발생)
         if random.random() < 0.1:  # 10% 확률로 움직임 발생
             artifact_start = random.randint(0, sequence_length-10)
             artifact_duration = random.randint(5, 10)
             artifact = 0.5 * np.random.randn(artifact_duration)
-            ir_signal[i, artifact_start:artifact_start+artifact_duration] += artifact
-            red_signal[i, artifact_start:artifact_start+artifact_duration] += artifact
+            ir_signal[artifact_start:artifact_start+artifact_duration] += artifact
+            red_signal[artifact_start:artifact_start+artifact_duration] += artifact
         
         # 노이즈 추가
-        ir_signal[i] += 0.05 * np.random.randn(sequence_length)
-        red_signal[i] += 0.05 * np.random.randn(sequence_length)
+        ir_signal += 0.05 * np.random.randn(sequence_length)
+        red_signal += 0.05 * np.random.randn(sequence_length)
+        
+        ir_signals.append(ir_signal)
+        red_signals.append(red_signal)
     
     # 가속도계 데이터 생성 (수면 중 움직임 반영)
-    acc_x = np.zeros((n_samples, sequence_length))
-    acc_y = np.zeros((n_samples, sequence_length))
-    acc_z = np.zeros((n_samples, sequence_length))
+    acc_x_signals = []
+    acc_y_signals = []
+    acc_z_signals = []
     
     for i in range(n_samples):
         # 기본 자세 (약간의 변동)
-        acc_x[i] = 0.1 * np.sin(2 * np.pi * 0.01 * t) + 0.05 * np.random.randn(sequence_length)
-        acc_y[i] = 0.1 * np.cos(2 * np.pi * 0.01 * t) + 0.05 * np.random.randn(sequence_length)
-        acc_z[i] = 1.0 + 0.1 * np.sin(2 * np.pi * 0.005 * t) + 0.05 * np.random.randn(sequence_length)
+        acc_x = 0.1 * np.sin(2 * np.pi * 0.01 * t) + 0.05 * np.random.randn(sequence_length)
+        acc_y = 0.1 * np.cos(2 * np.pi * 0.01 * t) + 0.05 * np.random.randn(sequence_length)
+        acc_z = 1.0 + 0.1 * np.sin(2 * np.pi * 0.005 * t) + 0.05 * np.random.randn(sequence_length)
         
         # 가끔 큰 움직임 추가
         if random.random() < 0.05:  # 5% 확률로 큰 움직임
             move_start = random.randint(0, sequence_length-20)
             move_duration = random.randint(10, 20)
-            acc_x[i, move_start:move_start+move_duration] += 0.5 * np.random.randn(move_duration)
-            acc_y[i, move_start:move_start+move_duration] += 0.5 * np.random.randn(move_duration)
-            acc_z[i, move_start:move_start+move_duration] += 0.5 * np.random.randn(move_duration)
+            acc_x[move_start:move_start+move_duration] += 0.5 * np.random.randn(move_duration)
+            acc_y[move_start:move_start+move_duration] += 0.5 * np.random.randn(move_duration)
+            acc_z[move_start:move_start+move_duration] += 0.5 * np.random.randn(move_duration)
+        
+        acc_x_signals.append(acc_x)
+        acc_y_signals.append(acc_y)
+        acc_z_signals.append(acc_z)
     
     # 자이로스코프 데이터 생성
-    gyro_x = 0.1 * np.random.randn(n_samples, sequence_length)
-    gyro_y = 0.1 * np.random.randn(n_samples, sequence_length)
-    gyro_z = 0.1 * np.random.randn(n_samples, sequence_length)
+    gyro_x_signals = []
+    gyro_y_signals = []
+    gyro_z_signals = []
+    
+    for i in range(n_samples):
+        gyro_x = 0.1 * np.random.randn(sequence_length)
+        gyro_y = 0.1 * np.random.randn(sequence_length)
+        gyro_z = 0.1 * np.random.randn(sequence_length)
+        
+        gyro_x_signals.append(gyro_x)
+        gyro_y_signals.append(gyro_y)
+        gyro_z_signals.append(gyro_z)
     
     # 수면 단계 생성 (더 현실적인 패턴)
-    sleep_stage = np.zeros(n_samples, dtype=int)
+    sleep_stages = []
     current_stage = 0
     stage_duration = 0
     
@@ -382,21 +404,21 @@ def generate_dummy_data(n_samples=1000, sequence_length=WINDOW_SIZE, sampling_ra
             # 단계 지속 시간 설정 (5-15분)
             stage_duration = random.randint(5, 15) * 60 * sampling_rate
         
-        sleep_stage[i] = current_stage
+        sleep_stages.append(current_stage)
         stage_duration -= 1
     
     data = {
-        'ir_signal': ir_signal,
-        'red_signal': red_signal,
-        'acc_x': acc_x,
-        'acc_y': acc_y,
-        'acc_z': acc_z,
-        'gyro_x': gyro_x,
-        'gyro_y': gyro_y,
-        'gyro_z': gyro_z,
-        'sleep_stage': sleep_stage
+        'ir_signals': ir_signals,
+        'red_signals': red_signals,
+        'acc_x_signals': acc_x_signals,
+        'acc_y_signals': acc_y_signals,
+        'acc_z_signals': acc_z_signals,
+        'gyro_x_signals': gyro_x_signals,
+        'gyro_y_signals': gyro_y_signals,
+        'gyro_z_signals': gyro_z_signals,
+        'sleep_stages': sleep_stages
     }
-    return pd.DataFrame(data)
+    return data
 
 def main():
     """메인 실행 함수"""
@@ -415,25 +437,25 @@ def main():
     features = []
     valid_indices = []
     
-    for i in range(len(data)):
+    for i in range(len(data['ir_signals'])):
         # PPG 특징 추출
         hr, hrv, rr, spo2, quality = preprocessor.extract_ppg_features(
-            data['ir_signal'].iloc[i].values,
-            data['red_signal'].iloc[i].values
+            data['ir_signals'][i],
+            data['red_signals'][i]
         )
         
         # 신호 품질이 낮은 경우 건너뛰기
-        if quality is not None and quality < 0.5:
+        if quality is not None and quality < QUALITY_THRESHOLD:
             continue
             
         # 움직임 특징 추출
         motion_features = motion_extractor.extract_features(
-            data['acc_x'].iloc[i].values,
-            data['acc_y'].iloc[i].values,
-            data['acc_z'].iloc[i].values,
-            data['gyro_x'].iloc[i].values,
-            data['gyro_y'].iloc[i].values,
-            data['gyro_z'].iloc[i].values
+            data['acc_x_signals'][i],
+            data['acc_y_signals'][i],
+            data['acc_z_signals'][i],
+            data['gyro_x_signals'][i],
+            data['gyro_y_signals'][i],
+            data['gyro_z_signals'][i]
         )
         
         # 모든 특징 결합
@@ -442,7 +464,7 @@ def main():
         valid_indices.append(i)
     
     features = np.array(features)
-    labels = data['sleep_stage'].iloc[valid_indices].values
+    labels = [data['sleep_stages'][i] for i in valid_indices]
     
     # 데이터 분할
     X_train, X_test, y_train, y_test = train_test_split(
@@ -455,8 +477,8 @@ def main():
     X_test = scaler.transform(X_test)
     
     # 데이터셋 및 데이터로더 생성
-    train_dataset = SleepDataset(X_train, y_train, WINDOW_SIZE, STRIDE_SIZE)
-    test_dataset = SleepDataset(X_test, y_test, WINDOW_SIZE, STRIDE_SIZE)
+    train_dataset = SleepDataset(X_train, y_train)
+    test_dataset = SleepDataset(X_test, y_test)
     
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
