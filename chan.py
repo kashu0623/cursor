@@ -14,6 +14,9 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+import os
+import mne
+import glob
 
 # 전역 설정 상수
 SAMPLING_RATE = 25.0        # Hz
@@ -24,6 +27,12 @@ QUALITY_THRESHOLD = 0.5     # 신호 품질 임계값
 # 계산된 상수
 WINDOW_SIZE = int(SAMPLING_RATE * WINDOW_DURATION)
 STRIDE_SIZE = int(SAMPLING_RATE * STRIDE_DURATION)
+
+# 학습 설정 상수
+DREAMT_DATA_DIR = "path/to/DREAMT"
+ACTUAL_DATA_DIR = "path/to/actual_data"
+PRETRAINED_PATH = "dreamt_pretrained.pth"
+FINETUNED_PATH = "finetuned_model.pth"
 
 class SleepDataPreprocessor:
     """수면 데이터 전처리 클래스
@@ -290,6 +299,411 @@ class SleepStageClassifier(nn.Module):
         
         lstm_out, _ = self.lstm(x)
         return self.fc(lstm_out[:, -1, :])  # 마지막 타임스텝의 출력만 사용
+
+def load_dreamt_data(data_dir):
+    """DREAMT 데이터 로드
+    
+    Args:
+        data_dir (str): DREAMT 데이터 디렉토리 경로
+        
+    Returns:
+        tuple: (features, labels)
+    """
+    features = []
+    labels = []
+    
+    # EDF 파일들 찾기
+    edf_files = glob.glob(os.path.join(data_dir, "*.edf"))
+    
+    for edf_file in edf_files:
+        try:
+            # EDF 파일 로드
+            raw = mne.io.read_raw_edf(edf_file, preload=True, verbose=False)
+            
+            # BVP 채널 찾기 (PPG 신호)
+            bvp_channel = None
+            for ch in raw.ch_names:
+                if 'BVP' in ch.upper() or 'PPG' in ch.upper():
+                    bvp_channel = ch
+                    break
+            
+            if bvp_channel is None:
+                continue
+                
+            # ACC 채널들 찾기
+            acc_channels = []
+            for ch in raw.ch_names:
+                if 'ACC' in ch.upper():
+                    acc_channels.append(ch)
+            
+            if len(acc_channels) < 3:
+                continue
+            
+            # 30초 epoch으로 분할
+            epoch_length = 30  # seconds
+            sfreq = raw.info['sfreq']
+            samples_per_epoch = int(epoch_length * sfreq)
+            
+            # BVP 신호 추출
+            bvp_data, _ = raw[bvp_channel, :]
+            bvp_data = bvp_data.flatten()
+            
+            # ACC 신호 추출
+            acc_data = []
+            for ch in acc_channels[:3]:  # X, Y, Z
+                data, _ = raw[ch, :]
+                acc_data.append(data.flatten())
+            
+            # Epoch 단위로 특징 추출
+            n_epochs = len(bvp_data) // samples_per_epoch
+            
+            for i in range(n_epochs):
+                start_idx = i * samples_per_epoch
+                end_idx = start_idx + samples_per_epoch
+                
+                # BVP 특징 추출 (4개)
+                bvp_epoch = bvp_data[start_idx:end_idx]
+                hr = np.mean(bvp_epoch)  # 간단한 심박수 추정
+                hrv = np.std(bvp_epoch)  # 간단한 HRV 추정
+                rr = np.ptp(bvp_epoch)  # 호흡률 추정
+                spo2 = 95.0  # 기본 SpO2 값
+                
+                # ACC 특징 추출 (5개)
+                acc_x = acc_data[0][start_idx:end_idx]
+                acc_y = acc_data[1][start_idx:end_idx]
+                acc_z = acc_data[2][start_idx:end_idx]
+                
+                acc_magnitude = np.sqrt(acc_x**2 + acc_y**2 + acc_z**2)
+                acc_mean = np.mean(acc_magnitude)
+                acc_std = np.std(acc_magnitude)
+                acc_var = np.var(acc_magnitude)
+                tilt_x = np.arctan2(acc_x, np.sqrt(acc_y**2 + acc_z**2))
+                tilt_y = np.arctan2(acc_y, np.sqrt(acc_x**2 + acc_z**2))
+                
+                # Gyro 특징 (0으로 채움)
+                gyro_mean = 0.0
+                gyro_std = 0.0
+                gyro_var = 0.0
+                
+                # 12차원 특징 벡터 생성
+                feature_vector = [
+                    hr, hrv, rr, spo2,  # PPG 특징 (4개)
+                    acc_mean, acc_std, acc_var, tilt_x, tilt_y,  # ACC 특징 (5개)
+                    gyro_mean, gyro_std, gyro_var  # Gyro 특징 (3개, 0으로 채움)
+                ]
+                
+                features.append(feature_vector)
+                
+                # 라벨은 나중에 hypnogram에서 매핑
+                labels.append(0)  # 임시 라벨
+                
+        except Exception as e:
+            print(f"Error loading {edf_file}: {e}")
+            continue
+    
+    return np.array(features), np.array(labels)
+
+def load_actual_data(data_dir):
+    """실제 수집 데이터 로드
+    
+    Args:
+        data_dir (str): 실제 데이터 디렉토리 경로
+        
+    Returns:
+        tuple: (features, labels)
+    """
+    features = []
+    labels = []
+    
+    # 데이터 파일들 찾기
+    data_files = glob.glob(os.path.join(data_dir, "*.csv"))
+    
+    for data_file in data_files:
+        try:
+            # CSV 파일 로드
+            df = pd.read_csv(data_file)
+            
+            # 필요한 컬럼 확인
+            required_cols = ['IR', 'RED', 'ACC_X', 'ACC_Y', 'ACC_Z', 'GYRO_X', 'GYRO_Y', 'GYRO_Z', 'LABEL']
+            if not all(col in df.columns for col in required_cols):
+                continue
+            
+            # 30초 epoch으로 분할
+            epoch_length = 30  # seconds
+            samples_per_epoch = int(epoch_length * SAMPLING_RATE)
+            
+            # 전처리기 초기화
+            preprocessor = SleepDataPreprocessor()
+            motion_extractor = MotionFeatureExtractor()
+            
+            # Epoch 단위로 특징 추출
+            n_epochs = len(df) // samples_per_epoch
+            
+            for i in range(n_epochs):
+                start_idx = i * samples_per_epoch
+                end_idx = start_idx + samples_per_epoch
+                
+                # 신호 추출
+                ir_signal = df['IR'].iloc[start_idx:end_idx].values
+                red_signal = df['RED'].iloc[start_idx:end_idx].values
+                acc_x = df['ACC_X'].iloc[start_idx:end_idx].values
+                acc_y = df['ACC_Y'].iloc[start_idx:end_idx].values
+                acc_z = df['ACC_Z'].iloc[start_idx:end_idx].values
+                gyro_x = df['GYRO_X'].iloc[start_idx:end_idx].values
+                gyro_y = df['GYRO_Y'].iloc[start_idx:end_idx].values
+                gyro_z = df['GYRO_Z'].iloc[start_idx:end_idx].values
+                
+                # PPG 특징 추출
+                hr, hrv, rr, spo2, quality = preprocessor.extract_ppg_features(ir_signal, red_signal)
+                
+                if quality is not None and quality < QUALITY_THRESHOLD:
+                    continue
+                
+                # 움직임 특징 추출
+                motion_features = motion_extractor.extract_features(acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z)
+                
+                # 12차원 특징 벡터 생성
+                feature_vector = [
+                    hr, hrv, rr, spo2,  # PPG 특징 (4개)
+                    motion_features['acc_mean'], motion_features['acc_std'], 
+                    motion_features['acc_variance'], motion_features['tilt_x'], 
+                    motion_features['tilt_y'],  # ACC 특징 (5개)
+                    motion_features['gyro_mean'], motion_features['gyro_std'], 
+                    motion_features['gyro_variance']  # Gyro 특징 (3개)
+                ]
+                
+                features.append(feature_vector)
+                
+                # 라벨 매핑 (0=Wake, 1=Light, 2=Deep, 3=REM)
+                label = df['LABEL'].iloc[end_idx-1]
+                labels.append(label)
+                
+        except Exception as e:
+            print(f"Error loading {data_file}: {e}")
+            continue
+    
+    return np.array(features), np.array(labels)
+
+def pretrain_on_dreamt(data_dir, output_path, epochs=30, batch_size=32, lr=1e-3):
+    """DREAMT 데이터로 Pre-train
+    
+    Args:
+        data_dir (str): DREAMT 데이터 디렉토리 경로
+        output_path (str): 모델 저장 경로
+        epochs (int): 학습 에포크 수
+        batch_size (int): 배치 크기
+        lr (float): 학습률
+    """
+    print("Loading DREAMT data...")
+    features, labels = load_dreamt_data(data_dir)
+    
+    if len(features) == 0:
+        print("No valid data found!")
+        return
+    
+    print(f"Loaded {len(features)} samples")
+    
+    # 데이터 분할
+    X_train, X_test, y_train, y_test = train_test_split(
+        features, labels, test_size=0.2, random_state=42
+    )
+    
+    # 데이터 정규화
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
+    
+    # 데이터셋 및 데이터로더 생성
+    train_dataset = SleepDataset(X_train, y_train)
+    test_dataset = SleepDataset(X_test, y_test)
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size)
+    
+    # 모델 초기화
+    model = SleepStageClassifier(input_size=12, hidden_size=64, num_classes=4)
+    
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    
+    # Early stopping 변수
+    best_val_loss = float('inf')
+    patience_counter = 0
+    best_model_state = None
+    
+    print("Starting pre-training...")
+    
+    # 학습 루프
+    for epoch in range(epochs):
+        # 학습
+        model.train()
+        train_loss = 0
+        for batch_x, batch_y in train_loader:
+            optimizer.zero_grad()
+            outputs = model(batch_x)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+        
+        # 검증
+        model.eval()
+        val_loss = 0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for batch_x, batch_y in test_loader:
+                outputs = model(batch_x)
+                loss = criterion(outputs, batch_y)
+                val_loss += loss.item()
+                
+                _, predicted = torch.max(outputs.data, 1)
+                total += batch_y.size(0)
+                correct += (predicted == batch_y).sum().item()
+        
+        # 평균 손실 계산
+        train_loss /= len(train_loader)
+        val_loss /= len(test_loader)
+        accuracy = 100 * correct / total
+        
+        # Early stopping 체크
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            best_model_state = model.state_dict().copy()
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= 10:  # Early stopping patience
+            print(f'Early stopping at epoch {epoch+1}')
+            break
+        
+        # 진행 상황 출력
+        if (epoch + 1) % 5 == 0:
+            print(f'Epoch [{epoch+1}/{epochs}]')
+            print(f'Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+            print(f'Accuracy: {accuracy:.2f}%')
+    
+    # 최적의 모델 상태 복원 및 저장
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        torch.save(best_model_state, output_path)
+        print(f"Pre-trained model saved to {output_path}")
+
+def finetune_on_actual(actual_data_dir, pretrained_path, output_path, epochs=20, batch_size=32, lr=1e-5):
+    """실제 데이터로 Fine-tune
+    
+    Args:
+        actual_data_dir (str): 실제 데이터 디렉토리 경로
+        pretrained_path (str): Pre-trained 모델 경로
+        output_path (str): Fine-tuned 모델 저장 경로
+        epochs (int): 학습 에포크 수
+        batch_size (int): 배치 크기
+        lr (float): 학습률
+    """
+    print("Loading actual data...")
+    features, labels = load_actual_data(actual_data_dir)
+    
+    if len(features) == 0:
+        print("No valid data found!")
+        return
+    
+    print(f"Loaded {len(features)} samples")
+    
+    # 데이터 분할
+    X_train, X_test, y_train, y_test = train_test_split(
+        features, labels, test_size=0.2, random_state=42
+    )
+    
+    # 데이터 정규화
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
+    
+    # 데이터셋 및 데이터로더 생성
+    train_dataset = SleepDataset(X_train, y_train)
+    test_dataset = SleepDataset(X_test, y_test)
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size)
+    
+    # 모델 초기화 및 pre-trained 가중치 로드
+    model = SleepStageClassifier(input_size=12, hidden_size=64, num_classes=4)
+    
+    if os.path.exists(pretrained_path):
+        model.load_state_dict(torch.load(pretrained_path))
+        print(f"Loaded pre-trained weights from {pretrained_path}")
+    else:
+        print("Pre-trained model not found, starting from scratch")
+    
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    
+    # Early stopping 변수
+    best_val_loss = float('inf')
+    patience_counter = 0
+    best_model_state = None
+    
+    print("Starting fine-tuning...")
+    
+    # 학습 루프
+    for epoch in range(epochs):
+        # 학습
+        model.train()
+        train_loss = 0
+        for batch_x, batch_y in train_loader:
+            optimizer.zero_grad()
+            outputs = model(batch_x)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+        
+        # 검증
+        model.eval()
+        val_loss = 0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for batch_x, batch_y in test_loader:
+                outputs = model(batch_x)
+                loss = criterion(outputs, batch_y)
+                val_loss += loss.item()
+                
+                _, predicted = torch.max(outputs.data, 1)
+                total += batch_y.size(0)
+                correct += (predicted == batch_y).sum().item()
+        
+        # 평균 손실 계산
+        train_loss /= len(train_loader)
+        val_loss /= len(test_loader)
+        accuracy = 100 * correct / total
+        
+        # Early stopping 체크
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            best_model_state = model.state_dict().copy()
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= 10:  # Early stopping patience
+            print(f'Early stopping at epoch {epoch+1}')
+            break
+        
+        # 진행 상황 출력
+        if (epoch + 1) % 5 == 0:
+            print(f'Epoch [{epoch+1}/{epochs}]')
+            print(f'Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+            print(f'Accuracy: {accuracy:.2f}%')
+    
+    # 최적의 모델 상태 복원 및 저장
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        torch.save(best_model_state, output_path)
+        print(f"Fine-tuned model saved to {output_path}")
 
 def generate_dummy_data(n_samples=1000, sequence_length=WINDOW_SIZE, sampling_rate=SAMPLING_RATE):
     """더미 데이터 생성
@@ -560,4 +974,15 @@ def main():
     print('학습 완료!')
 
 if __name__ == "__main__":
-    main()
+    # 1) DREAMT로 Pre-train
+    pretrain_on_dreamt(
+        data_dir=DREAMT_DATA_DIR,
+        output_path=PRETRAINED_PATH
+    )
+    
+    # 2) 실제 데이터로 Fine-tune
+    finetune_on_actual(
+        actual_data_dir=ACTUAL_DATA_DIR,
+        pretrained_path=PRETRAINED_PATH,
+        output_path=FINETUNED_PATH
+    )
