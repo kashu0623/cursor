@@ -27,6 +27,7 @@ SAMPLING_RATE = 25.0        # Hz
 WINDOW_DURATION = 30        # seconds
 STRIDE_DURATION = 10        # seconds
 QUALITY_THRESHOLD = 0.5     # 신호 품질 임계값
+NUM_CLASSES = 5             # 수면 단계 클래스 수 (W, N1, N2, N3, R)
 
 # 계산된 상수
 WINDOW_SIZE = int(SAMPLING_RATE * WINDOW_DURATION)
@@ -43,27 +44,27 @@ BATCH_SIZE = 32
 LR_PRETRAIN = 1e-3
 LR_FINETUNE = 1e-5
 
-def map_sleep_stage(annotation):
+def map_sleep_stage(raw_stage):
     """수면 단계 매핑 함수
     
     Args:
-        annotation (str): 원본 수면 단계 어노테이션
+        raw_stage (str): 원본 수면 단계 어노테이션
         
     Returns:
-        int: 매핑된 수면 단계 (0=Wake, 1=Light, 2=Deep, 3=REM)
+        int: 매핑된 수면 단계 (0=W, 1=N1, 2=N2, 3=N3, 4=R)
     """
-    annotation = annotation.upper()
-    
-    if 'WAKE' in annotation or 'W' in annotation:
-        return 0  # Wake
-    elif 'N1' in annotation or 'N2' in annotation or 'LIGHT' in annotation:
-        return 1  # Light sleep
-    elif 'N3' in annotation or 'DEEP' in annotation:
-        return 2  # Deep sleep
-    elif 'REM' in annotation or 'R' in annotation:
-        return 3  # REM sleep
+    if raw_stage == 'W':
+        return 0   # Wake
+    elif raw_stage == 'N1':
+        return 1   # N1
+    elif raw_stage == 'N2':
+        return 2   # N2
+    elif raw_stage == 'N3':
+        return 3   # Deep (N3)
+    elif raw_stage == 'R':
+        return 4   # REM
     else:
-        return None  # 알 수 없는 단계
+        return None
 
 class SleepDataPreprocessor:
     """수면 데이터 전처리 클래스
@@ -298,7 +299,7 @@ class SleepStageClassifier(nn.Module):
     Bidirectional LSTM 기반의 딥러닝 모델로 수면 단계를 분류합니다.
     """
     
-    def __init__(self, input_size, hidden_size=64, num_classes=4):
+    def __init__(self, input_size, hidden_size=64, num_classes=NUM_CLASSES):
         """초기화 함수
         
         Args:
@@ -552,7 +553,7 @@ def load_actual_data(data_dir):
                     
                     features.append(feature_vector)
                     
-                    # 라벨 매핑 (0=Wake, 1=Light, 2=Deep, 3=REM)
+                    # 라벨 매핑 (0=W, 1=N1, 2=N2, 3=N3, 4=R)
                     label = df['LABEL'].iloc[end_idx-1]
                     labels.append(label)
                     
@@ -585,9 +586,9 @@ def pretrain_on_dreamt(data_dir, output_path, epochs=EPOCHS_PRETRAIN, batch_size
     
     logging.info(f"Loaded {len(features)} samples")
     
-    # 데이터 분할
+    # 데이터 분할 (stratify 사용하여 클래스 균형 유지)
     X_train, X_test, y_train, y_test = train_test_split(
-        features, labels, test_size=0.2, random_state=42
+        features, labels, test_size=0.2, random_state=42, stratify=labels
     )
     
     # 데이터 정규화
@@ -603,7 +604,7 @@ def pretrain_on_dreamt(data_dir, output_path, epochs=EPOCHS_PRETRAIN, batch_size
     test_loader = DataLoader(test_dataset, batch_size=batch_size)
     
     # 모델 초기화
-    model = SleepStageClassifier(input_size=12, hidden_size=64, num_classes=4)
+    model = SleepStageClassifier(input_size=12, hidden_size=64, num_classes=NUM_CLASSES)
     
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -693,9 +694,9 @@ def finetune_on_actual(actual_data_dir, pretrained_path, output_path, epochs=EPO
     
     logging.info(f"Loaded {len(features)} samples")
     
-    # 데이터 분할
+    # 데이터 분할 (stratify 사용하여 클래스 균형 유지)
     X_train, X_test, y_train, y_test = train_test_split(
-        features, labels, test_size=0.2, random_state=42
+        features, labels, test_size=0.2, random_state=42, stratify=labels
     )
     
     # 데이터 정규화
@@ -711,7 +712,7 @@ def finetune_on_actual(actual_data_dir, pretrained_path, output_path, epochs=EPO
     test_loader = DataLoader(test_dataset, batch_size=batch_size)
     
     # 모델 초기화 및 pre-trained 가중치 로드
-    model = SleepStageClassifier(input_size=12, hidden_size=64, num_classes=4)
+    model = SleepStageClassifier(input_size=12, hidden_size=64, num_classes=NUM_CLASSES)
     
     if os.path.exists(pretrained_path):
         model.load_state_dict(torch.load(pretrained_path))
