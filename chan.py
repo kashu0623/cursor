@@ -17,6 +17,10 @@ from torch.utils.data import Dataset, DataLoader
 import os
 import mne
 import glob
+import logging
+
+# 로깅 설정
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # 전역 설정 상수
 SAMPLING_RATE = 25.0        # Hz
@@ -33,6 +37,33 @@ DREAMT_DATA_DIR = "path/to/DREAMT"
 ACTUAL_DATA_DIR = "path/to/actual_data"
 PRETRAINED_PATH = "dreamt_pretrained.pth"
 FINETUNED_PATH = "finetuned_model.pth"
+EPOCHS_PRETRAIN = 30
+EPOCHS_FINETUNE = 20
+BATCH_SIZE = 32
+LR_PRETRAIN = 1e-3
+LR_FINETUNE = 1e-5
+
+def map_sleep_stage(annotation):
+    """수면 단계 매핑 함수
+    
+    Args:
+        annotation (str): 원본 수면 단계 어노테이션
+        
+    Returns:
+        int: 매핑된 수면 단계 (0=Wake, 1=Light, 2=Deep, 3=REM)
+    """
+    annotation = annotation.upper()
+    
+    if 'WAKE' in annotation or 'W' in annotation:
+        return 0  # Wake
+    elif 'N1' in annotation or 'N2' in annotation or 'LIGHT' in annotation:
+        return 1  # Light sleep
+    elif 'N3' in annotation or 'DEEP' in annotation:
+        return 2  # Deep sleep
+    elif 'REM' in annotation or 'R' in annotation:
+        return 3  # REM sleep
+    else:
+        return None  # 알 수 없는 단계
 
 class SleepDataPreprocessor:
     """수면 데이터 전처리 클래스
@@ -315,10 +346,29 @@ def load_dreamt_data(data_dir):
     # EDF 파일들 찾기
     edf_files = glob.glob(os.path.join(data_dir, "*.edf"))
     
+    if not edf_files:
+        logging.warning(f"No EDF files found in {data_dir}")
+        return np.array([]), np.array([])
+    
+    # 전처리기 초기화
+    preprocessor = SleepDataPreprocessor()
+    motion_extractor = MotionFeatureExtractor()
+    
     for edf_file in edf_files:
         try:
+            # Hypnogram 파일 찾기
+            base_name = os.path.splitext(edf_file)[0]
+            hypno_file = f"{base_name}-Hypnogram.edf"
+            
+            if not os.path.exists(hypno_file):
+                logging.warning(f"Hypnogram file not found: {hypno_file}")
+                continue
+            
             # EDF 파일 로드
             raw = mne.io.read_raw_edf(edf_file, preload=True, verbose=False)
+            
+            # Hypnogram 파일 로드
+            hypno_raw = mne.io.read_raw_edf(hypno_file, preload=True, verbose=False)
             
             # BVP 채널 찾기 (PPG 신호)
             bvp_channel = None
@@ -328,6 +378,7 @@ def load_dreamt_data(data_dir):
                     break
             
             if bvp_channel is None:
+                logging.warning(f"No BVP/PPG channel found in {edf_file}")
                 continue
                 
             # ACC 채널들 찾기
@@ -337,6 +388,7 @@ def load_dreamt_data(data_dir):
                     acc_channels.append(ch)
             
             if len(acc_channels) < 3:
+                logging.warning(f"Insufficient ACC channels in {edf_file}")
                 continue
             
             # 30초 epoch으로 분할
@@ -354,51 +406,69 @@ def load_dreamt_data(data_dir):
                 data, _ = raw[ch, :]
                 acc_data.append(data.flatten())
             
+            # Hypnogram 어노테이션 추출
+            hypno_annotations = hypno_raw.annotations
+            
             # Epoch 단위로 특징 추출
             n_epochs = len(bvp_data) // samples_per_epoch
             
             for i in range(n_epochs):
-                start_idx = i * samples_per_epoch
-                end_idx = start_idx + samples_per_epoch
-                
-                # BVP 특징 추출 (4개)
-                bvp_epoch = bvp_data[start_idx:end_idx]
-                hr = np.mean(bvp_epoch)  # 간단한 심박수 추정
-                hrv = np.std(bvp_epoch)  # 간단한 HRV 추정
-                rr = np.ptp(bvp_epoch)  # 호흡률 추정
-                spo2 = 95.0  # 기본 SpO2 값
-                
-                # ACC 특징 추출 (5개)
-                acc_x = acc_data[0][start_idx:end_idx]
-                acc_y = acc_data[1][start_idx:end_idx]
-                acc_z = acc_data[2][start_idx:end_idx]
-                
-                acc_magnitude = np.sqrt(acc_x**2 + acc_y**2 + acc_z**2)
-                acc_mean = np.mean(acc_magnitude)
-                acc_std = np.std(acc_magnitude)
-                acc_var = np.var(acc_magnitude)
-                tilt_x = np.arctan2(acc_x, np.sqrt(acc_y**2 + acc_z**2))
-                tilt_y = np.arctan2(acc_y, np.sqrt(acc_x**2 + acc_z**2))
-                
-                # Gyro 특징 (0으로 채움)
-                gyro_mean = 0.0
-                gyro_std = 0.0
-                gyro_var = 0.0
-                
-                # 12차원 특징 벡터 생성
-                feature_vector = [
-                    hr, hrv, rr, spo2,  # PPG 특징 (4개)
-                    acc_mean, acc_std, acc_var, tilt_x, tilt_y,  # ACC 특징 (5개)
-                    gyro_mean, gyro_std, gyro_var  # Gyro 특징 (3개, 0으로 채움)
-                ]
-                
-                features.append(feature_vector)
-                
-                # 라벨은 나중에 hypnogram에서 매핑
-                labels.append(0)  # 임시 라벨
-                
+                try:
+                    start_idx = i * samples_per_epoch
+                    end_idx = start_idx + samples_per_epoch
+                    
+                    # BVP 특징 추출 (기존 전처리기 사용)
+                    bvp_epoch = bvp_data[start_idx:end_idx]
+                    
+                    # IR/RED 신호로 가정하여 PPG 특징 추출
+                    hr, hrv, rr, spo2, quality = preprocessor.extract_ppg_features(bvp_epoch, bvp_epoch)
+                    
+                    if quality is not None and quality < QUALITY_THRESHOLD:
+                        continue
+                    
+                    # ACC 특징 추출 (기존 전처리기 사용)
+                    acc_x = acc_data[0][start_idx:end_idx]
+                    acc_y = acc_data[1][start_idx:end_idx]
+                    acc_z = acc_data[2][start_idx:end_idx]
+                    
+                    # 자이로 신호는 0으로 채움
+                    gyro_x = np.zeros_like(acc_x)
+                    gyro_y = np.zeros_like(acc_y)
+                    gyro_z = np.zeros_like(acc_z)
+                    
+                    motion_features = motion_extractor.extract_features(acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z)
+                    
+                    # 12차원 특징 벡터 생성
+                    feature_vector = [
+                        hr, hrv, rr, spo2,  # PPG 특징 (4개)
+                        motion_features['acc_mean'], motion_features['acc_std'], 
+                        motion_features['acc_variance'], motion_features['tilt_x'], 
+                        motion_features['tilt_y'],  # ACC 특징 (5개)
+                        motion_features['gyro_mean'], motion_features['gyro_std'], 
+                        motion_features['gyro_variance']  # Gyro 특징 (3개, 0으로 채움)
+                    ]
+                    
+                    # 라벨 매핑
+                    epoch_time = start_idx / sfreq
+                    label = None
+                    
+                    for ann in hypno_annotations:
+                        if ann['onset'] <= epoch_time < ann['onset'] + ann['duration']:
+                            label = map_sleep_stage(ann['description'])
+                            break
+                    
+                    if label is None:
+                        continue  # 라벨이 없는 epoch는 건너뛰기
+                    
+                    features.append(feature_vector)
+                    labels.append(label)
+                    
+                except Exception as e:
+                    logging.warning(f"Error processing epoch {i} in {edf_file}: {e}")
+                    continue
+                    
         except Exception as e:
-            print(f"Error loading {edf_file}: {e}")
+            logging.warning(f"Error loading {edf_file}: {e}")
             continue
     
     return np.array(features), np.array(labels)
@@ -418,6 +488,14 @@ def load_actual_data(data_dir):
     # 데이터 파일들 찾기
     data_files = glob.glob(os.path.join(data_dir, "*.csv"))
     
+    if not data_files:
+        logging.warning(f"No CSV files found in {data_dir}")
+        return np.array([]), np.array([])
+    
+    # 전처리기 초기화
+    preprocessor = SleepDataPreprocessor()
+    motion_extractor = MotionFeatureExtractor()
+    
     for data_file in data_files:
         try:
             # CSV 파일 로드
@@ -425,66 +503,70 @@ def load_actual_data(data_dir):
             
             # 필요한 컬럼 확인
             required_cols = ['IR', 'RED', 'ACC_X', 'ACC_Y', 'ACC_Z', 'GYRO_X', 'GYRO_Y', 'GYRO_Z', 'LABEL']
-            if not all(col in df.columns for col in required_cols):
+            missing_cols = [col for col in required_cols if col not in df.columns]
+            
+            if missing_cols:
+                logging.warning(f"Missing columns in {data_file}: {missing_cols}")
                 continue
             
             # 30초 epoch으로 분할
             epoch_length = 30  # seconds
             samples_per_epoch = int(epoch_length * SAMPLING_RATE)
             
-            # 전처리기 초기화
-            preprocessor = SleepDataPreprocessor()
-            motion_extractor = MotionFeatureExtractor()
-            
             # Epoch 단위로 특징 추출
             n_epochs = len(df) // samples_per_epoch
             
             for i in range(n_epochs):
-                start_idx = i * samples_per_epoch
-                end_idx = start_idx + samples_per_epoch
-                
-                # 신호 추출
-                ir_signal = df['IR'].iloc[start_idx:end_idx].values
-                red_signal = df['RED'].iloc[start_idx:end_idx].values
-                acc_x = df['ACC_X'].iloc[start_idx:end_idx].values
-                acc_y = df['ACC_Y'].iloc[start_idx:end_idx].values
-                acc_z = df['ACC_Z'].iloc[start_idx:end_idx].values
-                gyro_x = df['GYRO_X'].iloc[start_idx:end_idx].values
-                gyro_y = df['GYRO_Y'].iloc[start_idx:end_idx].values
-                gyro_z = df['GYRO_Z'].iloc[start_idx:end_idx].values
-                
-                # PPG 특징 추출
-                hr, hrv, rr, spo2, quality = preprocessor.extract_ppg_features(ir_signal, red_signal)
-                
-                if quality is not None and quality < QUALITY_THRESHOLD:
+                try:
+                    start_idx = i * samples_per_epoch
+                    end_idx = start_idx + samples_per_epoch
+                    
+                    # 신호 추출
+                    ir_signal = df['IR'].iloc[start_idx:end_idx].values
+                    red_signal = df['RED'].iloc[start_idx:end_idx].values
+                    acc_x = df['ACC_X'].iloc[start_idx:end_idx].values
+                    acc_y = df['ACC_Y'].iloc[start_idx:end_idx].values
+                    acc_z = df['ACC_Z'].iloc[start_idx:end_idx].values
+                    gyro_x = df['GYRO_X'].iloc[start_idx:end_idx].values
+                    gyro_y = df['GYRO_Y'].iloc[start_idx:end_idx].values
+                    gyro_z = df['GYRO_Z'].iloc[start_idx:end_idx].values
+                    
+                    # PPG 특징 추출
+                    hr, hrv, rr, spo2, quality = preprocessor.extract_ppg_features(ir_signal, red_signal)
+                    
+                    if quality is not None and quality < QUALITY_THRESHOLD:
+                        continue
+                    
+                    # 움직임 특징 추출
+                    motion_features = motion_extractor.extract_features(acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z)
+                    
+                    # 12차원 특징 벡터 생성
+                    feature_vector = [
+                        hr, hrv, rr, spo2,  # PPG 특징 (4개)
+                        motion_features['acc_mean'], motion_features['acc_std'], 
+                        motion_features['acc_variance'], motion_features['tilt_x'], 
+                        motion_features['tilt_y'],  # ACC 특징 (5개)
+                        motion_features['gyro_mean'], motion_features['gyro_std'], 
+                        motion_features['gyro_variance']  # Gyro 특징 (3개)
+                    ]
+                    
+                    features.append(feature_vector)
+                    
+                    # 라벨 매핑 (0=Wake, 1=Light, 2=Deep, 3=REM)
+                    label = df['LABEL'].iloc[end_idx-1]
+                    labels.append(label)
+                    
+                except Exception as e:
+                    logging.warning(f"Error processing epoch {i} in {data_file}: {e}")
                     continue
-                
-                # 움직임 특징 추출
-                motion_features = motion_extractor.extract_features(acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z)
-                
-                # 12차원 특징 벡터 생성
-                feature_vector = [
-                    hr, hrv, rr, spo2,  # PPG 특징 (4개)
-                    motion_features['acc_mean'], motion_features['acc_std'], 
-                    motion_features['acc_variance'], motion_features['tilt_x'], 
-                    motion_features['tilt_y'],  # ACC 특징 (5개)
-                    motion_features['gyro_mean'], motion_features['gyro_std'], 
-                    motion_features['gyro_variance']  # Gyro 특징 (3개)
-                ]
-                
-                features.append(feature_vector)
-                
-                # 라벨 매핑 (0=Wake, 1=Light, 2=Deep, 3=REM)
-                label = df['LABEL'].iloc[end_idx-1]
-                labels.append(label)
-                
+                    
         except Exception as e:
-            print(f"Error loading {data_file}: {e}")
+            logging.warning(f"Error loading {data_file}: {e}")
             continue
     
     return np.array(features), np.array(labels)
 
-def pretrain_on_dreamt(data_dir, output_path, epochs=30, batch_size=32, lr=1e-3):
+def pretrain_on_dreamt(data_dir, output_path, epochs=EPOCHS_PRETRAIN, batch_size=BATCH_SIZE, lr=LR_PRETRAIN):
     """DREAMT 데이터로 Pre-train
     
     Args:
@@ -494,14 +576,14 @@ def pretrain_on_dreamt(data_dir, output_path, epochs=30, batch_size=32, lr=1e-3)
         batch_size (int): 배치 크기
         lr (float): 학습률
     """
-    print("Loading DREAMT data...")
+    logging.info("Loading DREAMT data...")
     features, labels = load_dreamt_data(data_dir)
     
     if len(features) == 0:
-        print("No valid data found!")
+        logging.error("No valid data found!")
         return
     
-    print(f"Loaded {len(features)} samples")
+    logging.info(f"Loaded {len(features)} samples")
     
     # 데이터 분할
     X_train, X_test, y_train, y_test = train_test_split(
@@ -531,7 +613,7 @@ def pretrain_on_dreamt(data_dir, output_path, epochs=30, batch_size=32, lr=1e-3)
     patience_counter = 0
     best_model_state = None
     
-    print("Starting pre-training...")
+    logging.info("Starting pre-training...")
     
     # 학습 루프
     for epoch in range(epochs):
@@ -576,22 +658,22 @@ def pretrain_on_dreamt(data_dir, output_path, epochs=30, batch_size=32, lr=1e-3)
             patience_counter += 1
             
         if patience_counter >= 10:  # Early stopping patience
-            print(f'Early stopping at epoch {epoch+1}')
+            logging.info(f'Early stopping at epoch {epoch+1}')
             break
         
         # 진행 상황 출력
         if (epoch + 1) % 5 == 0:
-            print(f'Epoch [{epoch+1}/{epochs}]')
-            print(f'Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
-            print(f'Accuracy: {accuracy:.2f}%')
+            logging.info(f'Epoch [{epoch+1}/{epochs}]')
+            logging.info(f'Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+            logging.info(f'Accuracy: {accuracy:.2f}%')
     
     # 최적의 모델 상태 복원 및 저장
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
         torch.save(best_model_state, output_path)
-        print(f"Pre-trained model saved to {output_path}")
+        logging.info(f"Pre-trained model saved to {output_path}")
 
-def finetune_on_actual(actual_data_dir, pretrained_path, output_path, epochs=20, batch_size=32, lr=1e-5):
+def finetune_on_actual(actual_data_dir, pretrained_path, output_path, epochs=EPOCHS_FINETUNE, batch_size=BATCH_SIZE, lr=LR_FINETUNE):
     """실제 데이터로 Fine-tune
     
     Args:
@@ -602,14 +684,14 @@ def finetune_on_actual(actual_data_dir, pretrained_path, output_path, epochs=20,
         batch_size (int): 배치 크기
         lr (float): 학습률
     """
-    print("Loading actual data...")
+    logging.info("Loading actual data...")
     features, labels = load_actual_data(actual_data_dir)
     
     if len(features) == 0:
-        print("No valid data found!")
+        logging.error("No valid data found!")
         return
     
-    print(f"Loaded {len(features)} samples")
+    logging.info(f"Loaded {len(features)} samples")
     
     # 데이터 분할
     X_train, X_test, y_train, y_test = train_test_split(
@@ -633,9 +715,9 @@ def finetune_on_actual(actual_data_dir, pretrained_path, output_path, epochs=20,
     
     if os.path.exists(pretrained_path):
         model.load_state_dict(torch.load(pretrained_path))
-        print(f"Loaded pre-trained weights from {pretrained_path}")
+        logging.info(f"Loaded pre-trained weights from {pretrained_path}")
     else:
-        print("Pre-trained model not found, starting from scratch")
+        logging.warning("Pre-trained model not found, starting from scratch")
     
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -645,7 +727,7 @@ def finetune_on_actual(actual_data_dir, pretrained_path, output_path, epochs=20,
     patience_counter = 0
     best_model_state = None
     
-    print("Starting fine-tuning...")
+    logging.info("Starting fine-tuning...")
     
     # 학습 루프
     for epoch in range(epochs):
@@ -690,288 +772,20 @@ def finetune_on_actual(actual_data_dir, pretrained_path, output_path, epochs=20,
             patience_counter += 1
             
         if patience_counter >= 10:  # Early stopping patience
-            print(f'Early stopping at epoch {epoch+1}')
+            logging.info(f'Early stopping at epoch {epoch+1}')
             break
         
         # 진행 상황 출력
         if (epoch + 1) % 5 == 0:
-            print(f'Epoch [{epoch+1}/{epochs}]')
-            print(f'Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
-            print(f'Accuracy: {accuracy:.2f}%')
+            logging.info(f'Epoch [{epoch+1}/{epochs}]')
+            logging.info(f'Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+            logging.info(f'Accuracy: {accuracy:.2f}%')
     
     # 최적의 모델 상태 복원 및 저장
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
         torch.save(best_model_state, output_path)
-        print(f"Fine-tuned model saved to {output_path}")
-
-def generate_dummy_data(n_samples=1000, sequence_length=WINDOW_SIZE, sampling_rate=SAMPLING_RATE):
-    """더미 데이터 생성
-    
-    Args:
-        n_samples (int): 생성할 샘플 수
-        sequence_length (int): 각 샘플의 시퀀스 길이
-        sampling_rate (float): 샘플링 주파수 (Hz)
-        
-    Returns:
-        dict: 생성된 더미 데이터
-    """
-    # 기본 신호 생성
-    t = np.linspace(0, sequence_length/sampling_rate, sequence_length)
-    
-    # 심박수 변동 (60-100 BPM)
-    hr_base = 80
-    hr_variation = 20 * np.sin(2 * np.pi * 0.001 * t)  # 천천히 변하는 심박수
-    hr = hr_base + hr_variation
-    
-    # PPG 신호 생성 (심박수 기반)
-    ir_signals = []
-    red_signals = []
-    
-    for i in range(n_samples):
-        # 기본 PPG 파형
-        ir_signal = np.zeros(sequence_length)
-        red_signal = np.zeros(sequence_length)
-        
-        for j in range(sequence_length):
-            phase = 2 * np.pi * hr[i] * t[j] / 60  # 심박수에 따른 위상
-            ir_signal[j] = np.sin(phase) + 0.2 * np.sin(2 * phase)  # 기본 파형
-            red_signal[j] = 0.8 * np.sin(phase) + 0.15 * np.sin(2 * phase)  # RED는 약간 다른 진폭
-            
-        # 호흡 변동 추가
-        breathing = 0.1 * np.sin(2 * np.pi * 0.2 * t)  # 0.2 Hz 호흡
-        ir_signal += breathing
-        red_signal += 0.8 * breathing
-        
-        # 움직임 아티팩트 추가 (가끔 발생)
-        if random.random() < 0.1:  # 10% 확률로 움직임 발생
-            artifact_start = random.randint(0, sequence_length-10)
-            artifact_duration = random.randint(5, 10)
-            artifact = 0.5 * np.random.randn(artifact_duration)
-            ir_signal[artifact_start:artifact_start+artifact_duration] += artifact
-            red_signal[artifact_start:artifact_start+artifact_duration] += artifact
-        
-        # 노이즈 추가
-        ir_signal += 0.05 * np.random.randn(sequence_length)
-        red_signal += 0.05 * np.random.randn(sequence_length)
-        
-        ir_signals.append(ir_signal)
-        red_signals.append(red_signal)
-    
-    # 가속도계 데이터 생성 (수면 중 움직임 반영)
-    acc_x_signals = []
-    acc_y_signals = []
-    acc_z_signals = []
-    
-    for i in range(n_samples):
-        # 기본 자세 (약간의 변동)
-        acc_x = 0.1 * np.sin(2 * np.pi * 0.01 * t) + 0.05 * np.random.randn(sequence_length)
-        acc_y = 0.1 * np.cos(2 * np.pi * 0.01 * t) + 0.05 * np.random.randn(sequence_length)
-        acc_z = 1.0 + 0.1 * np.sin(2 * np.pi * 0.005 * t) + 0.05 * np.random.randn(sequence_length)
-        
-        # 가끔 큰 움직임 추가
-        if random.random() < 0.05:  # 5% 확률로 큰 움직임
-            move_start = random.randint(0, sequence_length-20)
-            move_duration = random.randint(10, 20)
-            acc_x[move_start:move_start+move_duration] += 0.5 * np.random.randn(move_duration)
-            acc_y[move_start:move_start+move_duration] += 0.5 * np.random.randn(move_duration)
-            acc_z[move_start:move_start+move_duration] += 0.5 * np.random.randn(move_duration)
-        
-        acc_x_signals.append(acc_x)
-        acc_y_signals.append(acc_y)
-        acc_z_signals.append(acc_z)
-    
-    # 자이로스코프 데이터 생성
-    gyro_x_signals = []
-    gyro_y_signals = []
-    gyro_z_signals = []
-    
-    for i in range(n_samples):
-        gyro_x = 0.1 * np.random.randn(sequence_length)
-        gyro_y = 0.1 * np.random.randn(sequence_length)
-        gyro_z = 0.1 * np.random.randn(sequence_length)
-        
-        gyro_x_signals.append(gyro_x)
-        gyro_y_signals.append(gyro_y)
-        gyro_z_signals.append(gyro_z)
-    
-    # 수면 단계 생성 (더 현실적인 패턴)
-    sleep_stages = []
-    current_stage = 0
-    stage_duration = 0
-    
-    for i in range(n_samples):
-        if stage_duration <= 0:
-            # 다음 단계로 전환
-            if current_stage == 0:  # Awake
-                current_stage = 1  # Light sleep
-            elif current_stage == 1:  # Light sleep
-                if random.random() < 0.3:  # 30% 확률로 Deep sleep
-                    current_stage = 2
-                else:
-                    current_stage = 3  # REM sleep
-            elif current_stage == 2:  # Deep sleep
-                current_stage = 1  # Light sleep
-            else:  # REM sleep
-                if random.random() < 0.2:  # 20% 확률로 Awake
-                    current_stage = 0
-                else:
-                    current_stage = 1  # Light sleep
-            
-            # 단계 지속 시간 설정 (5-15분)
-            stage_duration = random.randint(5, 15) * 60 * sampling_rate
-        
-        sleep_stages.append(current_stage)
-        stage_duration -= 1
-    
-    data = {
-        'ir_signals': ir_signals,
-        'red_signals': red_signals,
-        'acc_x_signals': acc_x_signals,
-        'acc_y_signals': acc_y_signals,
-        'acc_z_signals': acc_z_signals,
-        'gyro_x_signals': gyro_x_signals,
-        'gyro_y_signals': gyro_y_signals,
-        'gyro_z_signals': gyro_z_signals,
-        'sleep_stages': sleep_stages
-    }
-    return data
-
-def main():
-    """메인 실행 함수"""
-    # 하이퍼파라미터 설정
-    BATCH_SIZE = 32
-    EPOCHS = 100
-    PATIENCE = 10  # Early stopping patience
-    
-    # 더미 데이터 생성
-    data = generate_dummy_data(sampling_rate=SAMPLING_RATE)
-    
-    # 전처리 및 특징 추출
-    preprocessor = SleepDataPreprocessor(sampling_rate=SAMPLING_RATE)
-    motion_extractor = MotionFeatureExtractor()
-    
-    features = []
-    valid_indices = []
-    
-    for i in range(len(data['ir_signals'])):
-        # PPG 특징 추출
-        hr, hrv, rr, spo2, quality = preprocessor.extract_ppg_features(
-            data['ir_signals'][i],
-            data['red_signals'][i]
-        )
-        
-        # 신호 품질이 낮은 경우 건너뛰기
-        if quality is not None and quality < QUALITY_THRESHOLD:
-            continue
-            
-        # 움직임 특징 추출
-        motion_features = motion_extractor.extract_features(
-            data['acc_x_signals'][i],
-            data['acc_y_signals'][i],
-            data['acc_z_signals'][i],
-            data['gyro_x_signals'][i],
-            data['gyro_y_signals'][i],
-            data['gyro_z_signals'][i]
-        )
-        
-        # 모든 특징 결합
-        feature_vector = [hr, hrv, rr, spo2] + list(motion_features.values())
-        features.append(feature_vector)
-        valid_indices.append(i)
-    
-    features = np.array(features)
-    labels = [data['sleep_stages'][i] for i in valid_indices]
-    
-    # 데이터 분할
-    X_train, X_test, y_train, y_test = train_test_split(
-        features, labels, test_size=0.2, random_state=42
-    )
-    
-    # 데이터 정규화
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_test = scaler.transform(X_test)
-    
-    # 데이터셋 및 데이터로더 생성
-    train_dataset = SleepDataset(X_train, y_train)
-    test_dataset = SleepDataset(X_test, y_test)
-    
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
-    
-    # 모델 초기화
-    model = SleepStageClassifier(
-        input_size=features.shape[1],
-        hidden_size=64,
-        num_classes=4
-    )
-    
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters())
-    
-    # Early stopping 변수
-    best_val_loss = float('inf')
-    patience_counter = 0
-    best_model_state = None
-    
-    # 학습 루프
-    for epoch in range(EPOCHS):
-        # 학습
-        model.train()
-        train_loss = 0
-        for batch_x, batch_y in train_loader:
-            optimizer.zero_grad()
-            outputs = model(batch_x)
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
-        
-        # 검증
-        model.eval()
-        val_loss = 0
-        correct = 0
-        total = 0
-        
-        with torch.no_grad():
-            for batch_x, batch_y in test_loader:
-                outputs = model(batch_x)
-                loss = criterion(outputs, batch_y)
-                val_loss += loss.item()
-                
-                _, predicted = torch.max(outputs.data, 1)
-                total += batch_y.size(0)
-                correct += (predicted == batch_y).sum().item()
-        
-        # 평균 손실 계산
-        train_loss /= len(train_loader)
-        val_loss /= len(test_loader)
-        accuracy = 100 * correct / total
-        
-        # Early stopping 체크
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-            best_model_state = model.state_dict().copy()
-        else:
-            patience_counter += 1
-            
-        if patience_counter >= PATIENCE:
-            print(f'Early stopping at epoch {epoch+1}')
-            break
-        
-        # 진행 상황 출력
-        if (epoch + 1) % 10 == 0:
-            print(f'Epoch [{epoch+1}/{EPOCHS}]')
-            print(f'Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
-            print(f'Accuracy: {accuracy:.2f}%')
-    
-    # 최적의 모델 상태 복원
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-    
-    print('학습 완료!')
+        logging.info(f"Fine-tuned model saved to {output_path}")
 
 if __name__ == "__main__":
     # 1) DREAMT로 Pre-train
