@@ -344,99 +344,59 @@ def load_dreamt_data(data_dir):
     features = []
     labels = []
     
-    # EDF 파일들 찾기
-    edf_files = glob.glob(os.path.join(data_dir, "*.edf"))
+    # CSV 파일들 찾기
+    csv_files = glob.glob(os.path.join(data_dir, "*.csv"))
     
-    if not edf_files:
-        logging.warning(f"No EDF files found in {data_dir}")
+    if not csv_files:
+        logging.warning(f"No CSV files found in {data_dir}")
         return np.array([]), np.array([])
     
     # 전처리기 초기화
     preprocessor = SleepDataPreprocessor()
     motion_extractor = MotionFeatureExtractor()
     
-    for edf_file in edf_files:
+    for csv_file in csv_files:
         try:
-            # Hypnogram 파일 찾기
-            base_name = os.path.splitext(edf_file)[0]
-            hypno_file = f"{base_name}-Hypnogram.edf"
+            # CSV 파일 로드
+            df = pd.read_csv(csv_file)
             
-            if not os.path.exists(hypno_file):
-                logging.warning(f"Hypnogram file not found: {hypno_file}")
-                continue
+            # 필요한 컬럼 확인
+            required_cols = ['IR', 'RED', 'ACC_X', 'ACC_Y', 'ACC_Z', 'GYRO_X', 'GYRO_Y', 'GYRO_Z', 'LABEL']
+            missing_cols = [col for col in required_cols if col not in df.columns]
             
-            # EDF 파일 로드
-            raw = mne.io.read_raw_edf(edf_file, preload=True, verbose=False)
-            
-            # Hypnogram 파일 로드
-            hypno_raw = mne.io.read_raw_edf(hypno_file, preload=True, verbose=False)
-            
-            # BVP 채널 찾기 (PPG 신호)
-            bvp_channel = None
-            for ch in raw.ch_names:
-                if 'BVP' in ch.upper() or 'PPG' in ch.upper():
-                    bvp_channel = ch
-                    break
-            
-            if bvp_channel is None:
-                logging.warning(f"No BVP/PPG channel found in {edf_file}")
-                continue
-                
-            # ACC 채널들 찾기
-            acc_channels = []
-            for ch in raw.ch_names:
-                if 'ACC' in ch.upper():
-                    acc_channels.append(ch)
-            
-            if len(acc_channels) < 3:
-                logging.warning(f"Insufficient ACC channels in {edf_file}")
+            if missing_cols:
+                logging.warning(f"Missing columns in {csv_file}: {missing_cols}")
                 continue
             
             # 30초 epoch으로 분할
             epoch_length = 30  # seconds
-            sfreq = raw.info['sfreq']
-            samples_per_epoch = int(epoch_length * sfreq)
-            
-            # BVP 신호 추출
-            bvp_data, _ = raw[bvp_channel, :]
-            bvp_data = bvp_data.flatten()
-            
-            # ACC 신호 추출
-            acc_data = []
-            for ch in acc_channels[:3]:  # X, Y, Z
-                data, _ = raw[ch, :]
-                acc_data.append(data.flatten())
-            
-            # Hypnogram 어노테이션 추출
-            hypno_annotations = hypno_raw.annotations
+            samples_per_epoch = int(epoch_length * SAMPLING_RATE)
             
             # Epoch 단위로 특징 추출
-            n_epochs = len(bvp_data) // samples_per_epoch
+            n_epochs = len(df) // samples_per_epoch
             
             for i in range(n_epochs):
                 try:
                     start_idx = i * samples_per_epoch
                     end_idx = start_idx + samples_per_epoch
                     
-                    # BVP 특징 추출 (기존 전처리기 사용)
-                    bvp_epoch = bvp_data[start_idx:end_idx]
+                    # 신호 추출
+                    ir_signal = df['IR'].iloc[start_idx:end_idx].values
+                    red_signal = df['RED'].iloc[start_idx:end_idx].values
+                    acc_x = df['ACC_X'].iloc[start_idx:end_idx].values
+                    acc_y = df['ACC_Y'].iloc[start_idx:end_idx].values
+                    acc_z = df['ACC_Z'].iloc[start_idx:end_idx].values
+                    gyro_x = df['GYRO_X'].iloc[start_idx:end_idx].values
+                    gyro_y = df['GYRO_Y'].iloc[start_idx:end_idx].values
+                    gyro_z = df['GYRO_Z'].iloc[start_idx:end_idx].values
                     
-                    # IR/RED 신호로 가정하여 PPG 특징 추출
-                    hr, hrv, rr, spo2, quality = preprocessor.extract_ppg_features(bvp_epoch, bvp_epoch)
+                    # PPG 특징 추출
+                    hr, hrv, rr, spo2, quality = preprocessor.extract_ppg_features(ir_signal, red_signal)
                     
                     if quality is not None and quality < QUALITY_THRESHOLD:
                         continue
                     
-                    # ACC 특징 추출 (기존 전처리기 사용)
-                    acc_x = acc_data[0][start_idx:end_idx]
-                    acc_y = acc_data[1][start_idx:end_idx]
-                    acc_z = acc_data[2][start_idx:end_idx]
-                    
-                    # 자이로 신호는 0으로 채움
-                    gyro_x = np.zeros_like(acc_x)
-                    gyro_y = np.zeros_like(acc_y)
-                    gyro_z = np.zeros_like(acc_z)
-                    
+                    # 움직임 특징 추출
                     motion_features = motion_extractor.extract_features(acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z)
                     
                     # 12차원 특징 벡터 생성
@@ -446,30 +406,21 @@ def load_dreamt_data(data_dir):
                         motion_features['acc_variance'], motion_features['tilt_x'], 
                         motion_features['tilt_y'],  # ACC 특징 (5개)
                         motion_features['gyro_mean'], motion_features['gyro_std'], 
-                        motion_features['gyro_variance']  # Gyro 특징 (3개, 0으로 채움)
+                        motion_features['gyro_variance']  # Gyro 특징 (3개)
                     ]
                     
-                    # 라벨 매핑
-                    epoch_time = start_idx / sfreq
-                    label = None
-                    
-                    for ann in hypno_annotations:
-                        if ann['onset'] <= epoch_time < ann['onset'] + ann['duration']:
-                            label = map_sleep_stage(ann['description'])
-                            break
-                    
-                    if label is None:
-                        continue  # 라벨이 없는 epoch는 건너뛰기
-                    
                     features.append(feature_vector)
+                    
+                    # 라벨 매핑 (0=W, 1=N1, 2=N2, 3=N3, 4=R)
+                    label = df['LABEL'].iloc[end_idx-1]
                     labels.append(label)
                     
                 except Exception as e:
-                    logging.warning(f"Error processing epoch {i} in {edf_file}: {e}")
+                    logging.warning(f"Error processing epoch {i} in {csv_file}: {e}")
                     continue
                     
         except Exception as e:
-            logging.warning(f"Error loading {edf_file}: {e}")
+            logging.warning(f"Error loading {csv_file}: {e}")
             continue
     
     return np.array(features), np.array(labels)
@@ -789,15 +740,14 @@ def finetune_on_actual(actual_data_dir, pretrained_path, output_path, epochs=EPO
         logging.info(f"Fine-tuned model saved to {output_path}")
 
 if __name__ == "__main__":
-    # 1) DREAMT로 Pre-train
     pretrain_on_dreamt(
-        data_dir=DREAMT_DATA_DIR,
-        output_path=PRETRAINED_PATH
+        data_dir=r"C:\Users\ahrid\dreamt_pretrain",
+        output_path="dreamt_pretrained.pth"
     )
     
-    # 2) 실제 데이터로 Fine-tune
-    finetune_on_actual(
-        actual_data_dir=ACTUAL_DATA_DIR,
-        pretrained_path=PRETRAINED_PATH,
-        output_path=FINETUNED_PATH
-    )
+    # 2) 실제 데이터로 Fine-tune (주석 처리)
+    # finetune_on_actual(
+    #     actual_data_dir=ACTUAL_DATA_DIR,
+    #     pretrained_path=PRETRAINED_PATH,
+    #     output_path=FINETUNED_PATH
+    # )
