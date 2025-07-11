@@ -9,6 +9,7 @@ if torch.cuda.is_available():
 
 import pandas as pd
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import os
@@ -294,7 +295,7 @@ class RawLSTMClassifier(nn.Module):
         return out
 
 
-def pretrain_on_dreamt(data_dir, output_path, epochs=EPOCHS_PRETRAIN, batch_size=BATCH_SIZE, lr=LR_PRETRAIN, majority_ratio=MAJORITY_RATIO, signal_channels=None, label_column=None):
+def pretrain_on_dreamt(data_dir, output_path, epochs=EPOCHS_PRETRAIN, batch_size=BATCH_SIZE, lr=LR_PRETRAIN, majority_ratio=MAJORITY_RATIO, signal_channels=None, label_column=None, class_weights=None):
     """
     DREAMT 데이터로 Pre-train
     
@@ -349,7 +350,20 @@ def pretrain_on_dreamt(data_dir, output_path, epochs=EPOCHS_PRETRAIN, batch_size
     model = model.to(device)
     logging.info(f"Using device: {device}")
     
-    criterion = nn.CrossEntropyLoss()
+    # 클래스별 가중치 설정 (클래스 불균형 해결)
+    if class_weights is None:
+        # 자동 계산: 적은 샘플에 높은 가중치
+        class_counts = np.bincount(y_train)
+        total_samples = len(y_train)
+        class_weights = total_samples / (len(class_counts) * class_counts)
+    else:
+        # 사용자 지정 가중치 사용
+        class_weights = np.array(class_weights)
+    
+    weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
+    logging.info(f"Class weights: {class_weights}")
+    
+    criterion = nn.CrossEntropyLoss(weight=weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     
     # Early stopping 변수
@@ -378,6 +392,8 @@ def pretrain_on_dreamt(data_dir, output_path, epochs=EPOCHS_PRETRAIN, batch_size
         val_loss = 0
         correct = 0
         total = 0
+        all_preds = []
+        all_targets = []
         
         with torch.no_grad():
             for batch_x, batch_y in test_loader:
@@ -389,6 +405,8 @@ def pretrain_on_dreamt(data_dir, output_path, epochs=EPOCHS_PRETRAIN, batch_size
                 _, predicted = torch.max(outputs.data, 1)
                 total += batch_y.size(0)
                 correct += (predicted == batch_y).sum().item()
+                all_preds.extend(predicted.cpu().numpy())
+                all_targets.extend(batch_y.cpu().numpy())
         
         # 평균 손실 계산
         train_loss /= len(train_loader)
@@ -417,6 +435,12 @@ def pretrain_on_dreamt(data_dir, output_path, epochs=EPOCHS_PRETRAIN, batch_size
         model.load_state_dict(best_model_state)
         torch.save(best_model_state, output_path)
         logging.info(f"Pre-trained model saved to {output_path}")
+    
+    # === 평가 메트릭 출력 ===
+    logging.info("\nConfusion Matrix (Validation Set):")
+    print(confusion_matrix(all_targets, all_preds))
+    logging.info("\nClassification Report (Validation Set):")
+    print(classification_report(all_targets, all_preds, digits=4))
 
 
 def finetune_on_actual(actual_data_dir, pretrained_path, output_path, epochs=EPOCHS_FINETUNE, batch_size=BATCH_SIZE, lr=LR_FINETUNE, majority_ratio=MAJORITY_RATIO, signal_channels=None, label_column=None):
@@ -481,7 +505,13 @@ def finetune_on_actual(actual_data_dir, pretrained_path, output_path, epochs=EPO
     else:
         logging.warning("Pre-trained model not found, starting from scratch")
     
-    criterion = nn.CrossEntropyLoss()
+    # 클래스별 가중치 계산 (클래스 불균형 해결)
+    class_counts = np.bincount(y_train)
+    total_samples = len(y_train)
+    class_weights = total_samples / (len(class_counts) * class_counts)
+    weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
+    
+    criterion = nn.CrossEntropyLoss(weight=weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     
     # Early stopping 변수
@@ -554,7 +584,7 @@ def finetune_on_actual(actual_data_dir, pretrained_path, output_path, epochs=EPO
 if __name__ == "__main__":
     # 현재 4채널 (BVP + ACC_X/Y/Z) 기반 학습
     pretrain_on_dreamt(
-        data_dir=r"C:\Users\ahrid\dreamt_pretrain",
+        data_dir=r"C:\dreamt_pretrain",
         output_path="dreamt_pretrained_4ch.pth"
     )
     
