@@ -16,7 +16,8 @@ import os
 import glob
 import logging
 from collections import Counter
-from scipy import signal  # PPG 신호 분석을 위한 scipy.signal 추가
+from scipy.signal import welch, find_peaks  # PPG 신호 분석을 위한 scipy.signal 추가
+from scipy.integrate import trapezoid  # 적분을 위한 trapezoid 함수 추가
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -80,7 +81,7 @@ def find_ppg_peaks(bvp_signal, sampling_rate=64.0, distance_min=0.5, prominence=
     distance_samples = int(distance_min * sampling_rate)
     
     # scipy.signal.find_peaks를 사용하여 피크 검출
-    peak_indices, peak_properties = signal.find_peaks(
+    peak_indices, peak_properties = find_peaks(
         bvp_signal,
         distance=distance_samples,
         prominence=prominence,
@@ -91,9 +92,44 @@ def find_ppg_peaks(bvp_signal, sampling_rate=64.0, distance_min=0.5, prominence=
     return peak_indices, peak_properties
 
 
-def calculate_hr_hrv_features(bvp_signal, sampling_rate=64.0, distance_min=0.5, prominence=0.1):
+def calculate_frequency_features(ibi_seconds):
     """
-    PPG 신호에서 심박수(HR)와 HRV 지표(RMSSD)를 계산하는 함수
+    IBI 데이터로부터 주파수 피처(VLF, LF, HF power, LF/HF ratio)를 계산하는 함수
+    
+    Args:
+        ibi_seconds (np.array): IBI 데이터 (초 단위)
+        
+    Returns:
+        dict: 주파수 영역 HRV 피처를 포함한 딕셔너리
+            - vlf: Very Low Frequency power (0.003-0.04 Hz)
+            - lf: Low Frequency power (0.04-0.15 Hz)
+            - hf: High Frequency power (0.15-0.4 Hz)
+            - lf_hf_ratio: LF/HF ratio
+    """
+    if len(ibi_seconds) < 10:
+        return {'vlf': 0.0, 'lf': 0.0, 'hf': 0.0, 'lf_hf_ratio': 0.0}
+    
+    fs = 4.0
+    steps = 1 / fs
+    x_interp = np.arange(ibi_seconds.min(), ibi_seconds.max(), steps)
+    y_interp = np.interp(x_interp, np.cumsum(ibi_seconds), ibi_seconds)
+    
+    f, Pxx = welch(y_interp, fs=fs, nperseg=len(y_interp))
+    
+    vlf_band, lf_band, hf_band = (0.003, 0.04), (0.04, 0.15), (0.15, 0.4)
+    
+    vlf_power = trapezoid(Pxx[(f >= vlf_band[0]) & (f < vlf_band[1])], f[(f >= vlf_band[0]) & (f < vlf_band[1])])
+    lf_power = trapezoid(Pxx[(f >= lf_band[0]) & (f < lf_band[1])], f[(f >= lf_band[0]) & (f < lf_band[1])])
+    hf_power = trapezoid(Pxx[(f >= hf_band[0]) & (f < hf_band[1])], f[(f >= hf_band[0]) & (f < hf_band[1])])
+    
+    lf_hf_ratio = lf_power / hf_power if hf_power > 0 else 0.0
+    
+    return {'vlf': vlf_power, 'lf': lf_power, 'hf': hf_power, 'lf_hf_ratio': lf_hf_ratio}
+
+
+def calculate_all_features(bvp_signal, sampling_rate=64.0, distance_min=0.5, prominence=0.1):
+    """
+    PPG 신호에서 시간 및 주파수 영역 HRV 피처를 모두 계산하는 함수
     
     Args:
         bvp_signal (np.array): BVP 신호 데이터 (1차원 배열)
@@ -102,53 +138,49 @@ def calculate_hr_hrv_features(bvp_signal, sampling_rate=64.0, distance_min=0.5, 
         prominence (float): 피크의 최소 prominence (기본값: 0.1)
         
     Returns:
-        dict: HR과 HRV 지표를 포함한 딕셔너리
+        dict: 시간 및 주파수 영역 HRV 피처를 포함한 딕셔너리
             - hr: 분당 심박수 (float)
             - rmssd: RMSSD HRV 지표 (float)
             - peak_count: 검출된 피크 수 (int)
             - ibi_mean: 평균 IBI (초, float)
             - ibi_std: IBI 표준편차 (초, float)
+            - vlf: Very Low Frequency power (0.003-0.04 Hz)
+            - lf: Low Frequency power (0.04-0.15 Hz)
+            - hf: High Frequency power (0.15-0.4 Hz)
+            - lf_hf_ratio: LF/HF ratio
     """
-    # PPG 신호에서 피크 검출
-    peak_indices, peak_properties = find_ppg_peaks(
-        bvp_signal, sampling_rate, distance_min, prominence
-    )
+    peak_indices, _ = find_ppg_peaks(bvp_signal, sampling_rate, distance_min, prominence)
     
-    # 피크가 충분하지 않으면 기본값 반환
-    if len(peak_indices) < 2:
-        return {
-            'hr': 0.0,
-            'rmssd': 0.0,
-            'peak_count': len(peak_indices),
-            'ibi_mean': 0.0,
-            'ibi_std': 0.0
-        }
-    
-    # IBI(Inter-Beat Interval) 계산 (샘플 단위)
-    ibi_samples = np.diff(peak_indices)
-    
-    # 샘플을 초 단위로 변환
-    ibi_seconds = ibi_samples / sampling_rate
-    
-    # 분당 심박수 계산 (60초 / 평균 IBI)
-    ibi_mean = np.mean(ibi_seconds)
-    hr = 60.0 / ibi_mean if ibi_mean > 0 else 0.0
-    
-    # RMSSD 계산 (Root Mean Square of Successive Differences)
-    # 연속된 IBI 간의 차이의 제곱근 평균
-    ibi_diff = np.diff(ibi_seconds)
-    rmssd = np.sqrt(np.mean(ibi_diff ** 2)) if len(ibi_diff) > 0 else 0.0
-    
-    # IBI 표준편차
-    ibi_std = np.std(ibi_seconds)
-    
-    return {
-        'hr': hr,
-        'rmssd': rmssd,
-        'peak_count': len(peak_indices),
-        'ibi_mean': ibi_mean,
-        'ibi_std': ibi_std
+    # 기본 피처 초기화
+    time_features = {
+        'hr': 0.0, 
+        'rmssd': 0.0, 
+        'peak_count': len(peak_indices), 
+        'ibi_mean': 0.0, 
+        'ibi_std': 0.0
     }
+    freq_features = {
+        'vlf': 0.0, 
+        'lf': 0.0, 
+        'hf': 0.0, 
+        'lf_hf_ratio': 0.0
+    }
+    
+    if len(peak_indices) >= 2:
+        ibi_seconds = np.diff(peak_indices) / sampling_rate
+        
+        if len(ibi_seconds) > 0:
+            ibi_mean = np.mean(ibi_seconds)
+            time_features['hr'] = 60.0 / ibi_mean if ibi_mean > 0 else 0.0
+            time_features['ibi_mean'] = ibi_mean
+            time_features['ibi_std'] = np.std(ibi_seconds)
+            
+            if len(ibi_seconds) >= 2:
+                time_features['rmssd'] = np.sqrt(np.mean(np.diff(ibi_seconds) ** 2))
+            
+            freq_features = calculate_frequency_features(ibi_seconds)
+    
+    return {**time_features, **freq_features}
 
 
 def map_sleep_stage(raw_label):
@@ -168,7 +200,7 @@ def extract_epochs_with_features_from_df(df, majority_ratio=MAJORITY_RATIO, sign
     Returns:
         tuple: (raw_signals, features, labels) 
             - raw_signals: np.array of shape (N, num_channels, 1920) - 원시 신호 데이터
-            - features: np.array of shape (N, 5) - HR/HRV 피처 (HR, RMSSD, PeakCount, IBI_mean, IBI_std)
+            - features: np.array of shape (N, 9) - HR/HRV 피처 (HR, RMSSD, PeakCount, IBI_mean, IBI_std, VLF, LF, HF, LF/HF_ratio)
             - labels: np.array of shape (N,) - 수면 단계 라벨
     """
     if signal_channels is None:
@@ -243,18 +275,22 @@ def extract_epochs_with_features_from_df(df, majority_ratio=MAJORITY_RATIO, sign
                 bvp_index = signal_channels.index('bvp')
                 bvp_signal = signals[bvp_index]
                 
-                # 5개 HR/HRV 피처 모두 계산
-                hr_hrv_dict = calculate_hr_hrv_features(bvp_signal, sampling_rate=SAMPLING_RATE)
-                hr_feature = hr_hrv_dict['hr']
-                rmssd_feature = hr_hrv_dict['rmssd']
-                peak_count_feature = hr_hrv_dict['peak_count']
-                ibi_mean_feature = hr_hrv_dict['ibi_mean']
-                ibi_std_feature = hr_hrv_dict['ibi_std']
+                # 9개 HR/HRV 피처 모두 계산 (시간 + 주파수 영역)
+                all_features_dict = calculate_all_features(bvp_signal, sampling_rate=SAMPLING_RATE)
+                hr_feature = all_features_dict['hr']
+                rmssd_feature = all_features_dict['rmssd']
+                peak_count_feature = all_features_dict['peak_count']
+                ibi_mean_feature = all_features_dict['ibi_mean']
+                ibi_std_feature = all_features_dict['ibi_std']
+                vlf_feature = all_features_dict['vlf']
+                lf_feature = all_features_dict['lf']
+                hf_feature = all_features_dict['hf']
+                lf_hf_ratio_feature = all_features_dict['lf_hf_ratio']
                 
-                logging.debug(f"Epoch {i}: HR={hr_feature:.1f}, RMSSD={rmssd_feature:.3f}, PeakCount={peak_count_feature}, IBI_mean={ibi_mean_feature:.3f}, IBI_std={ibi_std_feature:.3f}")
+                logging.debug(f"Epoch {i}: HR={hr_feature:.1f}, RMSSD={rmssd_feature:.3f}, PeakCount={peak_count_feature}, IBI_mean={ibi_mean_feature:.3f}, IBI_std={ibi_std_feature:.3f}, VLF={vlf_feature:.3f}, LF={lf_feature:.3f}, HF={hf_feature:.3f}, LF/HF={lf_hf_ratio_feature:.3f}")
             
-            # 수정: 5개 피처 모두 포함한 배열 생성 [HR, RMSSD, PeakCount, IBI_mean, IBI_std]
-            feature_vector = np.array([hr_feature, rmssd_feature, peak_count_feature, ibi_mean_feature, ibi_std_feature], dtype=np.float32)
+            # 수정: 9개 피처 모두 포함한 배열 생성 [HR, RMSSD, PeakCount, IBI_mean, IBI_std, VLF, LF, HF, LF/HF_ratio]
+            feature_vector = np.array([hr_feature, rmssd_feature, peak_count_feature, ibi_mean_feature, ibi_std_feature, vlf_feature, lf_feature, hf_feature, lf_hf_ratio_feature], dtype=np.float32)
                 
             raw_signals.append(signals)
             features.append(feature_vector)
@@ -281,7 +317,7 @@ def load_dreamt_data(data_dir, majority_ratio=MAJORITY_RATIO, signal_channels=No
     Returns:
         tuple: (raw_signals, features, labels) 
             - raw_signals: np.array of shape (N, num_channels, 1920) - 원시 신호 데이터
-            - features: np.array of shape (N, 5) - HR/HRV 피처 (5개 값)
+            - features: np.array of shape (N, 9) - HR/HRV 피처 (9개 값)
             - labels: np.array of shape (N,) - 수면 단계 라벨
     """
     if signal_channels is None:
@@ -398,7 +434,7 @@ class SleepDualInputDataset(Dataset):
         """
         Args:
             raw_signals: 원시 신호 데이터 (N, num_channels, 1920)
-            features: HR/HRV 피처 (N, 5) - [HR, RMSSD, PeakCount, IBI_mean, IBI_std]
+            features: HR/HRV 피처 (N, 9) - [HR, RMSSD, PeakCount, IBI_mean, IBI_std, VLF, LF, HF, LF/HF_ratio]
             labels: 수면 단계 라벨 (N,)
         """
         self.raw_signals = raw_signals.astype(np.float32)
@@ -413,9 +449,9 @@ class SleepDualInputDataset(Dataset):
         if len(self.raw_signals.shape) != 3 or self.raw_signals.shape[2] != 1920:
             raise ValueError(f"Expected raw_signals shape (N, num_channels, 1920), got {self.raw_signals.shape}")
         
-        # 수정: 피처 차원을 5로 변경 (HR, RMSSD, PeakCount, IBI_mean, IBI_std)
-        if len(self.features.shape) != 2 or self.features.shape[1] != 5:
-            raise ValueError(f"Expected features shape (N, 5), got {self.features.shape}")
+        # 수정: 피처 차원을 9로 변경 (HR, RMSSD, PeakCount, IBI_mean, IBI_std, VLF, LF, HF, LF/HF_ratio)
+        if len(self.features.shape) != 2 or self.features.shape[1] != 9:
+            raise ValueError(f"Expected features shape (N, 9), got {self.features.shape}")
         
         self.num_channels = self.raw_signals.shape[1]
         logging.info(f"SleepDualInputDataset initialized with {len(self.raw_signals)} samples")
@@ -433,14 +469,14 @@ class SleepDualInputDataset(Dataset):
         Returns:
             tuple: (x_raw, x_features, y)
                 - x_raw: 원시 신호 (1920, num_channels) - LSTM용
-                - x_features: HR/HRV 피처 (5,) - MLP용
+                - x_features: HR/HRV 피처 (9,) - MLP용
                 - y: 라벨 (스칼라)
         """
         # 원시 신호: (num_channels, 1920) -> (1920, num_channels) for LSTM
         x_raw = torch.from_numpy(self.raw_signals[idx].T)  # shape: (1920, num_channels)
         
-        # HR/HRV 피처: (2,) -> (2,) for MLP
-        x_features = torch.from_numpy(self.features[idx])   # shape: (2,)
+        # HR/HRV 피처: (9,) -> (9,) for MLP
+        x_features = torch.from_numpy(self.features[idx])   # shape: (9,)
         
         # 라벨
         y = torch.tensor(self.labels[idx])
@@ -499,7 +535,7 @@ class DualInputLSTMClassifier(nn.Module):
     1. x_raw: 원시 신호 데이터 (BVP, 가속도 등)
     2. x_features: HR/HRV 피처 벡터 (심박수, RMSSD, 피크수, IBI 평균, IBI 표준편차)
     """
-    def __init__(self, raw_input_size=None, feature_input_size=5, lstm_hidden_size=64, 
+    def __init__(self, raw_input_size=None, feature_input_size=9, lstm_hidden_size=64, 
                  lstm_num_layers=2, mlp_hidden_size=32, num_classes=NUM_CLASSES, dropout=0.2):
         super().__init__()
         
@@ -815,8 +851,8 @@ def pretrain_on_dreamt_dual_input(data_dir, output_path, epochs=EPOCHS_PRETRAIN,
     
     # 듀얼 입력 모델 초기화
     raw_input_size = len(signal_channels)
-    # 수정: feature_input_size를 5로 변경 (HR, RMSSD, PeakCount, IBI_mean, IBI_std)
-    feature_input_size = 5
+    # 수정: feature_input_size를 9로 변경 (HR, RMSSD, PeakCount, IBI_mean, IBI_std, VLF, LF, HF, LF/HF_ratio)
+    feature_input_size = 9
     model = DualInputLSTMClassifier(
         raw_input_size=raw_input_size,
         feature_input_size=feature_input_size,
@@ -1083,7 +1119,7 @@ if __name__ == "__main__":
         # 최종 듀얼 입력 모델 학습을 실행합니다.
         pretrain_on_dreamt_dual_input(
             data_dir=r"C:\\dreamt_pretrain",
-            output_path="dreamt_pretrained_4class_model.pth"
+            output_path="dreamt_pretrained_4class_9features.pth"
         )
         print("\n🎉 학습이 성공적으로 완료되었습니다!")
     except Exception as e:
@@ -1127,7 +1163,7 @@ def test_ppg_analysis():
     
     # HR과 HRV 피처 계산 테스트
     print("\n--- HR/HRV 피처 계산 테스트 ---")
-    hr_hrv_features = calculate_hr_hrv_features(ppg_signal, sampling_rate=sampling_rate)
+    hr_hrv_features = calculate_all_features(ppg_signal, sampling_rate=sampling_rate)
     
     print("계산된 피처:")
     for key, value in hr_hrv_features.items():
@@ -1216,7 +1252,7 @@ def test_epoch_extraction_with_features():
         print(f"Features shape: {features.shape}")
         print(f"Labels shape: {labels.shape}")
         
-        # 첫 번째 epoch의 피처 확인 (5개 피처 모두 표시)
+                    # 첫 번째 epoch의 피처 확인 (9개 피처 모두 표시)
         if len(features) > 0:
             first_hr = features[0][0]
             first_rmssd = features[0][1]
@@ -1250,8 +1286,8 @@ def test_dual_input_model():
     batch_size = 4
     seq_len = 1920
     num_channels = 4
-    # 수정: feature_size를 5로 변경 (5개 HR/HRV 피처)
-    feature_size = 5
+    # 수정: feature_size를 9로 변경 (9개 HR/HRV 피처)
+    feature_size = 9
     num_classes = 4
     
     # 가상 데이터 생성

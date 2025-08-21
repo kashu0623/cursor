@@ -25,8 +25,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 SAMPLING_RATE = 64.0        # Hz
 WINDOW_DURATION = 30        # seconds
 WINDOW_SIZE = int(SAMPLING_RATE * WINDOW_DURATION)  # 1920 samples
-# [수정] 4클래스 분류 (W, Light, N3, R)
-NUM_CLASSES = 4             # 수면 단계 클래스 수 (W, Light, N3, R)
+NUM_CLASSES = 5             # 수면 단계 클래스 수 (W, N1, N2, N3, R)
 MAJORITY_RATIO = 0.6        # majority voting 비율
 
 # 현재 사용할 신호 채널 설정 (향후 확장 가능)
@@ -49,16 +48,14 @@ LR_PRETRAIN = 1e-3
 LR_FINETUNE = 1e-5
 
 LABEL_MAP = {
-    'W': 0, 'P': 0,    # Wake: 0
-    'N1': 1, 'N2': 1,  # Light Sleep: 1
-    'N3': 2,           # Deep Sleep: 2
-    'R': 3, 'REM': 3   # REM Sleep: 3
+    'W': 0, 'P': 0,  # Wake
+    'N1': 1,
+    'N2': 2,
+    'N3': 3,
+    'R': 4, 'REM': 4
 }
 
 INV_LABEL_MAP = {v: k for k, v in LABEL_MAP.items()}
-
-# [수정] 4클래스용 이름 리스트
-CLASS_NAMES_4 = ['Wake', 'Light', 'N3', 'REM']
 
 
 def find_ppg_peaks(bvp_signal, sampling_rate=64.0, distance_min=0.5, prominence=0.1):
@@ -433,7 +430,7 @@ class SleepDualInputDataset(Dataset):
         Returns:
             tuple: (x_raw, x_features, y)
                 - x_raw: 원시 신호 (1920, num_channels) - LSTM용
-                - x_features: HR/HRV 피처 (5,) - MLP용
+                - x_features: HR/HRV 피처 (2,) - MLP용
                 - y: 라벨 (스칼라)
         """
         # 원시 신호: (num_channels, 1920) -> (1920, num_channels) for LSTM
@@ -753,7 +750,7 @@ def pretrain_on_dreamt(data_dir, output_path, epochs=EPOCHS_PRETRAIN, batch_size
     logging.info("\nConfusion Matrix (Validation Set):")
     print(confusion_matrix(all_targets, all_preds))
     logging.info("\nClassification Report (Validation Set):")
-    print(classification_report(all_targets, all_preds, digits=4, target_names=CLASS_NAMES_4))
+    print(classification_report(all_targets, all_preds, digits=4))
 
 
 def pretrain_on_dreamt_dual_input(data_dir, output_path, epochs=EPOCHS_PRETRAIN, batch_size=BATCH_SIZE, 
@@ -933,7 +930,7 @@ def pretrain_on_dreamt_dual_input(data_dir, output_path, epochs=EPOCHS_PRETRAIN,
     print(confusion_matrix(all_targets, all_preds))
     logging.info("Classification Report (Validation Set):")
     # 수정: 버그 수정 - all_targets를 all_preds로 변경하여 정확한 평가 가능
-    print(classification_report(all_targets, all_preds, digits=4, target_names=CLASS_NAMES_4))
+    print(classification_report(all_targets, all_preds, digits=4))
     
     return model
 
@@ -1083,7 +1080,7 @@ if __name__ == "__main__":
         # 최종 듀얼 입력 모델 학습을 실행합니다.
         pretrain_on_dreamt_dual_input(
             data_dir=r"C:\\dreamt_pretrain",
-            output_path="dreamt_pretrained_4class_model.pth"
+            output_path="dreamt_pretrained_dual_input_5features_log_weights.pth"
         )
         print("\n🎉 학습이 성공적으로 완료되었습니다!")
     except Exception as e:
@@ -1252,7 +1249,7 @@ def test_dual_input_model():
     num_channels = 4
     # 수정: feature_size를 5로 변경 (5개 HR/HRV 피처)
     feature_size = 5
-    num_classes = 4
+    num_classes = 5
     
     # 가상 데이터 생성
     x_raw = torch.randn(batch_size, seq_len, num_channels)      # 원시 신호
